@@ -117,27 +117,41 @@ with st.sidebar:
 # ── Step 1 — Upload ────────────────────────────────────────────────────────────
 st.subheader("Step 1 — Upload MT5 OHLCV CSV")
 st.caption(
-    "Export from MT5: File → Save As → CSV  "
-    "| Format: `Date,Time,Open,High,Low,Close,Volume`"
+    "Drag & drop one **or more** CSV files — they will be merged into one dataset.  \n"
+    "Format: `Date,Time,Open,High,Low,Close,Volume`  |  Export from MT5: File → Save As → CSV"
 )
 
-uploaded_file = st.file_uploader(
-    "csv", type=["csv"], label_visibility="collapsed"
+uploaded_files = st.file_uploader(
+    "csv",
+    type=["csv"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
 )
 
-if uploaded_file is not None:
-    if st.session_state.get("_last_file") != uploaded_file.name:
+# Detect when the set of selected files changes and reset state
+if uploaded_files:
+    current_key = frozenset(f.name for f in uploaded_files)
+    if st.session_state.get("_last_files") != current_key:
         for k in ("upload_id", "upload_info", "analysis"):
             st.session_state.pop(k, None)
-        st.session_state["_last_file"] = uploaded_file.name
+        st.session_state["_last_files"] = current_key
 
     if "upload_id" not in st.session_state:
-        with st.spinner("Uploading and validating CSV…"):
+        label = (
+            f"Uploading {len(uploaded_files)} file(s) and merging dataset…"
+            if len(uploaded_files) > 1
+            else "Uploading and validating CSV…"
+        )
+        with st.spinner(label):
             try:
+                parts = [
+                    ("files", (f.name, f.getvalue(), "text/csv"))
+                    for f in uploaded_files
+                ]
                 resp = requests.post(
-                    f"{API}/api/v1/upload",
-                    files={"file": (uploaded_file.name, uploaded_file.getvalue(), "text/csv")},
-                    timeout=30,
+                    f"{API}/api/v1/upload-multiple",
+                    files=parts,
+                    timeout=60,
                 )
             except requests.exceptions.ConnectionError:
                 st.error(
@@ -151,7 +165,7 @@ if uploaded_file is not None:
             st.session_state["upload_id"]   = info["upload_id"]
             st.session_state["upload_info"] = info
         else:
-            body   = resp.json() if resp.headers.get("content-type","").startswith("application") else {}
+            body   = resp.json() if resp.headers.get("content-type", "").startswith("application") else {}
             detail = body.get("detail", resp.text)
             st.error(f"Upload failed ({resp.status_code}): {detail}")
             st.stop()
@@ -159,17 +173,35 @@ if uploaded_file is not None:
 if "upload_info" in st.session_state:
     info = st.session_state["upload_info"]
     val  = info.get("validation", {})
+    n_files = info.get("file_count", 1)
 
-    st.success(
-        f"✅  **{info['filename']}** — {info['rows']:,} bars  "
-        f"({info['start'][:10]} → {info['end'][:10]})"
-    )
+    # ── Combined dataset summary ──────────────────────────────────────────────
+    if n_files > 1:
+        st.success(
+            f"✅  **{n_files} files merged** — {info['rows']:,} bars total  "
+            f"({info['start'][:10]} → {info['end'][:10]})"
+        )
+        # Per-file breakdown table
+        with st.expander(f"📂 Files included ({n_files})", expanded=True):
+            per_file = info.get("files", [])
+            file_df  = pd.DataFrame(per_file).rename(columns={
+                "filename": "File",
+                "rows":     "Bars",
+                "start":    "Start",
+                "end":      "End",
+            })
+            st.dataframe(file_df, use_container_width=True, hide_index=True)
+    else:
+        st.success(
+            f"✅  **{info['filename']}** — {info['rows']:,} bars  "
+            f"({info['start'][:10]} → {info['end'][:10]})"
+        )
 
-    # Validation report
-    with st.expander("📋 CSV Validation Report", expanded=bool(val.get("warnings"))):
+    # ── Validation report ─────────────────────────────────────────────────────
+    with st.expander("📋 Dataset Validation Report", expanded=bool(val.get("warnings"))):
         col_a, col_b = st.columns(2)
         with col_a:
-            st.metric("Rows loaded", f"{val.get('row_count', info['rows']):,}")
+            st.metric("Total bars",  f"{val.get('row_count', info['rows']):,}")
             st.metric("Date range",  val.get("date_range", "—"))
         with col_b:
             errs  = val.get("errors", [])
@@ -183,7 +215,7 @@ if "upload_info" in st.session_state:
             else:
                 st.success("All checks passed.")
 
-    with st.expander("Data preview (first 5 rows)"):
+    with st.expander("Data preview (first 5 rows of combined dataset)"):
         st.dataframe(pd.DataFrame(info["preview"]), use_container_width=True)
 
 

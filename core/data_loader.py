@@ -8,6 +8,10 @@ Phase 2 additions:
   - validate_dataframe() returns a structured validation report
   - OHLC integrity checks (High >= Low, High >= Open/Close, etc.)
   - Duplicate timestamp removal
+
+Phase 2 (multi-file):
+  - combine_dataframes() merges multiple DataFrames, deduplicates, sorts
+  - save_dataframe() writes back to MT5 CSV format so load_csv() can reload it
   - Minimum bar count enforcement
 """
 
@@ -161,3 +165,42 @@ def validate_dataframe(df: pd.DataFrame) -> dict:
         "errors": errors,
         "warnings": warnings,
     }
+
+
+# ── Multi-file helpers ────────────────────────────────────────────────────────
+
+def combine_dataframes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Merge a list of OHLCV DataFrames into one sorted, deduplicated DataFrame.
+    Overlapping timestamps keep the row from the first file that contained them.
+    """
+    if not dfs:
+        raise ValueError("No DataFrames to combine.")
+    if len(dfs) == 1:
+        return dfs[0].copy()
+
+    combined = pd.concat(dfs)
+    combined = combined[~combined.index.duplicated(keep="first")]
+    combined = combined.sort_index()
+    return combined
+
+
+def save_dataframe(df: pd.DataFrame, path: "Path") -> None:
+    """
+    Write a DataFrame back to MT5 CSV format so load_csv() can reload it.
+    Columns written: Date, Time, Open, High, Low, Close, Volume
+    """
+    from pathlib import Path as _Path
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    idx = pd.to_datetime(df.index)
+    out = pd.DataFrame({
+        "Date":   idx.strftime("%Y.%m.%d"),
+        "Time":   idx.strftime("%H:%M"),
+        "Open":   df["Open"].values,
+        "High":   df["High"].values,
+        "Low":    df["Low"].values,
+        "Close":  df["Close"].values,
+        "Volume": df["Volume"].values,
+    })
+    out.to_csv(path, index=False)

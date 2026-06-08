@@ -93,6 +93,7 @@ def list_modules():
 
 @app.post("/api/v1/upload", tags=["Data"])
 async def upload_csv(file: UploadFile = File(...)):
+    """Single-file upload (kept for backward compatibility)."""
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
 
@@ -105,7 +106,6 @@ async def upload_csv(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"CSV parse error: {exc}")
 
-    # Run Phase 2 validation
     validation = data_loader.validate_dataframe(df)
     if not validation["valid"]:
         raise HTTPException(
@@ -121,11 +121,86 @@ async def upload_csv(file: UploadFile = File(...)):
         "upload_id":  upload_id,
         "filename":   file.filename,
         "rows":       len(df),
+        "file_count": 1,
+        "files":      [{"filename": file.filename, "rows": len(df),
+                        "start": str(df.index[0]), "end": str(df.index[-1])}],
         "start":      str(df.index[0]),
         "end":        str(df.index[-1]),
         "validation": validation,
         "preview":    (
             df.head(5)
+            .reset_index()
+            .rename(columns={"datetime": "Datetime"})
+            .to_dict(orient="records")
+        ),
+    }
+
+
+@app.post("/api/v1/upload-multiple", tags=["Data"])
+async def upload_multiple_csv(files: list[UploadFile] = File(...)):
+    """
+    Accept 1–N CSV files, parse each, combine into one sorted dataset,
+    validate, persist to disk, and return a single upload_id for analysis.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    per_file: list[dict] = []
+    dfs: list = []
+
+    for file in files:
+        if not file.filename.lower().endswith(".csv"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{file.filename}' is not a .csv file.",
+            )
+        content = await file.read()
+        try:
+            df_i = data_loader.load_csv(io.BytesIO(content))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{file.filename}: {exc}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"{file.filename}: parse error — {exc}")
+
+        per_file.append({
+            "filename": file.filename,
+            "rows":     len(df_i),
+            "start":    str(df_i.index[0]),
+            "end":      str(df_i.index[-1]),
+        })
+        dfs.append(df_i)
+
+    # Merge all files into one sorted, deduplicated DataFrame
+    combined = data_loader.combine_dataframes(dfs)
+
+    validation = data_loader.validate_dataframe(combined)
+    if not validation["valid"]:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Combined dataset failed validation",
+                    "errors": validation["errors"]},
+        )
+
+    # Persist as a re-loadable MT5 CSV
+    start_tag = combined.index[0].strftime("%Y%m%d")
+    end_tag   = combined.index[-1].strftime("%Y%m%d")
+    combined_name = f"combined_{len(files)}files_{start_tag}_{end_tag}.csv"
+    dest = UPLOAD_DIR / combined_name
+    data_loader.save_dataframe(combined, dest)
+
+    upload_id = save_upload(combined_name, str(dest), len(combined))
+
+    return {
+        "upload_id":  upload_id,
+        "filename":   combined_name,
+        "rows":       len(combined),
+        "file_count": len(files),
+        "files":      per_file,
+        "start":      str(combined.index[0]),
+        "end":        str(combined.index[-1]),
+        "validation": validation,
+        "preview":    (
+            combined.head(5)
             .reset_index()
             .rename(columns={"datetime": "Datetime"})
             .to_dict(orient="records")
