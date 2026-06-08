@@ -1,172 +1,217 @@
 """
-Liquidity Sweep Module — Phase 1
-=================================
-Detects stop-hunt / liquidity-grab candles on XAUUSD:
+Liquidity Sweep Module — Phase 2
+==================================
+Real swing-high / swing-low detection with rejection-candle confirmation.
+No lookahead: a swing at bar j is only "confirmed" once bar j + swing_n has closed.
 
-  Bullish sweep : wick below the prior N-bar low, candle closes back above → Long
-  Bearish sweep : wick above the prior N-bar high, candle closes back below → Short
+──────────────────────────────────────────────────────────────────
+Signal logic
+──────────────────────────────────────────────────────────────────
+BEARISH SWEEP  (sweep of a prior swing HIGH → SELL)
+  1. A confirmed swing high at level H exists.
+  2. Current candle's High > H  (the level is taken out — liquidity swept).
+  3. Current candle's Close < H (price rejects back below the level).
+  4. Current candle is bearish  (Close < Open) — body confirms rejection.
+  → Entry SELL at next candle Open.
+  → SL  = sweep candle High + buffer.
+  → TP  = entry − (SL − entry) × RR.
 
-Entry  : close of the sweep candle (next bar open approximation)
-Stop   : wick extreme ± tiny buffer (1 pip = 0.10 on XAUUSD)
-Target : entry ± stop_distance × RR
+BULLISH SWEEP  (sweep of a prior swing LOW → BUY)
+  1. A confirmed swing low at level L exists.
+  2. Current candle's Low < L   (level taken out).
+  3. Current candle's Close > L (price rejects back above the level).
+  4. Current candle is bullish  (Close > Open) — body confirms rejection.
+  → Entry BUY at next candle Open.
+  → SL  = sweep candle Low − buffer.
+  → TP  = entry + (entry − SL) × RR.
+──────────────────────────────────────────────────────────────────
 
-Simulation walks forward bar-by-bar to determine win / loss / open.
-Overlapping signals are suppressed so each trade zone is used only once.
+Execution is handled by core.backtest (no lookahead simulation).
 """
 
 from __future__ import annotations
 
-from typing import Literal
-
+import numpy as np
 import pandas as pd
 
-_PIP = 0.10  # XAUUSD minimum buffer (1 pip)
+from core import backtest
+
+_BUFFER: float = 0.20   # SL buffer beyond sweep wick (≈ 2 XAUUSD pips)
+_MIN_SWEEP: float = 0.10  # minimum pip distance the wick must exceed the level
 
 
-# ── Signal detection ──────────────────────────────────────────────────────────
+# ── Swing point detection ─────────────────────────────────────────────────────
 
-def _classify(df: pd.DataFrame, i: int, lookback: int) -> Literal["bullish", "bearish", "none"]:
-    """Return sweep direction for candle at index i, or 'none'."""
-    if i < lookback:
-        return "none"
+def _find_swings(
+    df: pd.DataFrame, n: int
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """
+    Pre-compute all swing highs and lows using a symmetric n-bar window.
 
-    window = df.iloc[i - lookback : i]
-    c = df.iloc[i]
+    A bar at index j is a swing HIGH if its High is >= every High in [j-n, j+n].
+    A bar at index j is a swing LOW  if its Low  is <= every Low  in [j-n, j+n].
 
-    prior_low = window["Low"].min()
-    prior_high = window["High"].max()
+    Bars in [0, n-1] and [len-n, len-1] cannot be swings (window incomplete).
 
-    # Bearish sweep takes priority (wick above prior high, close below)
-    if c["High"] > prior_high and c["Close"] < prior_high:
-        return "bearish"
+    Returns (swing_highs, swing_lows) as lists of (bar_index, price).
+    """
+    highs_arr = df["High"].to_numpy()
+    lows_arr  = df["Low"].to_numpy()
+    n_bars    = len(df)
 
-    # Bullish sweep (wick below prior low, close above)
-    if c["Low"] < prior_low and c["Close"] > prior_low:
-        return "bullish"
+    swing_highs: list[tuple[int, float]] = []
+    swing_lows:  list[tuple[int, float]] = []
 
-    return "none"
+    for j in range(n, n_bars - n):
+        window_h = highs_arr[j - n : j + n + 1]
+        window_l = lows_arr[j - n : j + n + 1]
+
+        if highs_arr[j] >= window_h.max() - 1e-8:
+            swing_highs.append((j, float(highs_arr[j])))
+
+        if lows_arr[j] <= window_l.min() + 1e-8:
+            swing_lows.append((j, float(lows_arr[j])))
+
+    return swing_highs, swing_lows
 
 
-# ── Trade simulation ──────────────────────────────────────────────────────────
+# ── Signal generation (no lookahead) ─────────────────────────────────────────
 
-def _simulate(
+def generate_signals(
     df: pd.DataFrame,
-    start_i: int,
-    entry: float,
-    stop: float,
-    target: float,
-    direction: str,
-    max_bars: int,
-) -> tuple[str, float, int]:
+    rr: float,
+    swing_n: int,
+    max_recent_swings: int = 8,
+) -> list[dict]:
     """
-    Walk forward from start_i.
-    Returns (result, r_multiple, bars_held).
+    Scan each candle for a liquidity sweep + rejection setup.
+    Only uses information available at the time of the signal candle.
+
+    Parameters
+    ----------
+    df                : OHLCV DataFrame (DatetimeIndex).
+    rr                : Risk-reward ratio for TP placement.
+    swing_n           : Bars on each side needed to confirm a swing point.
+    max_recent_swings : Look back at this many of the most-recent confirmed swings.
+
+    Returns
+    -------
+    List of signal dicts consumed by core.backtest.execute().
     """
-    stop_dist = abs(entry - stop)
-    if stop_dist == 0:
-        return "open", 0.0, 0
+    all_highs, all_lows = _find_swings(df, swing_n)
+    signals: list[dict] = []
 
-    end_i = min(start_i + max_bars, len(df))
+    # The earliest bar at which any confirmed swing exists
+    first_valid = swing_n * 2
+    last_signal_bar = -1  # throttle: skip adjacent bars with signals
 
-    for i in range(start_i, end_i):
-        h = df["High"].iloc[i]
-        lo = df["Low"].iloc[i]
+    for i in range(first_valid, len(df) - 1):
+        if i == last_signal_bar:
+            continue
 
-        if direction == "long":
-            if lo <= stop:
-                return "loss", -1.0, i - start_i + 1
-            if h >= target:
-                r = abs(target - entry) / stop_dist
-                return "win", round(r, 2), i - start_i + 1
-        else:
-            if h >= stop:
-                return "loss", -1.0, i - start_i + 1
-            if lo <= target:
-                r = abs(entry - target) / stop_dist
-                return "win", round(r, 2), i - start_i + 1
+        # A swing at bar j is confirmed at bar j + swing_n (i.e. j ≤ i - swing_n)
+        confirmed_highs = [(j, lvl) for j, lvl in all_highs if j + swing_n <= i]
+        confirmed_lows  = [(j, lvl) for j, lvl in all_lows  if j + swing_n <= i]
 
-    # Still open — mark with current unrealised R
-    last_close = df["Close"].iloc[end_i - 1]
-    if direction == "long":
-        r = (last_close - entry) / stop_dist
-    else:
-        r = (entry - last_close) / stop_dist
+        recent_highs = confirmed_highs[-max_recent_swings:]
+        recent_lows  = confirmed_lows[-max_recent_swings:]
 
-    return "open", round(r, 2), max_bars
+        c_open  = float(df["Open"].iloc[i])
+        c_high  = float(df["High"].iloc[i])
+        c_low   = float(df["Low"].iloc[i])
+        c_close = float(df["Close"].iloc[i])
+
+        signal: dict | None = None
+
+        # ── BEARISH: sweep of prior swing high ────────────────────────────
+        for _j, swing_level in reversed(recent_highs):
+            if c_high - swing_level < _MIN_SWEEP:
+                continue          # wick too small — not a meaningful sweep
+            if c_close >= swing_level:
+                continue          # no rejection — price still above the level
+            if c_close >= c_open:
+                continue          # candle is bullish — body doesn't confirm
+
+            sl_raw  = c_high + _BUFFER
+            sl_dist = sl_raw - c_close
+            if sl_dist <= 0:
+                continue
+
+            signal = {
+                "signal_bar":  i,
+                "direction":   "SELL",
+                "swept_level": swing_level,
+                "sweep_size":  round(c_high - swing_level, 2),
+                "close_price": c_close,
+                "sl_dist":     round(sl_dist, 2),
+                "rr":          rr,
+            }
+            break   # use the most-recent qualifying swing high
+
+        # ── BULLISH: sweep of prior swing low ─────────────────────────────
+        if signal is None:
+            for _j, swing_level in reversed(recent_lows):
+                if swing_level - c_low < _MIN_SWEEP:
+                    continue
+                if c_close <= swing_level:
+                    continue      # no rejection — price still below the level
+                if c_close <= c_open:
+                    continue      # bearish candle body — doesn't confirm
+
+                sl_raw  = c_low - _BUFFER
+                sl_dist = c_close - sl_raw
+                if sl_dist <= 0:
+                    continue
+
+                signal = {
+                    "signal_bar":  i,
+                    "direction":   "BUY",
+                    "swept_level": swing_level,
+                    "sweep_size":  round(swing_level - c_low, 2),
+                    "close_price": c_close,
+                    "sl_dist":     round(sl_dist, 2),
+                    "rr":          rr,
+                }
+                break
+
+        if signal:
+            signals.append(signal)
+            last_signal_bar = i   # throttle consecutive signals
+
+    return signals
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def run(df: pd.DataFrame, rr: float = 2.0, lookback: int = 20, max_bars: int = 100) -> list[dict]:
+def run(
+    df: pd.DataFrame,
+    rr: float = 2.0,
+    lookback: int = 5,
+    max_bars: int = 200,
+) -> list[dict]:
     """
-    Detect liquidity sweeps and simulate trades.
+    Full pipeline: detect sweeps → execute via backtest engine → return trades.
 
     Parameters
     ----------
-    df       : OHLCV DataFrame with DatetimeIndex (from data_loader.load_csv)
-    rr       : Risk-to-reward ratio for targets
-    lookback : Number of preceding bars used to identify the swing level
-    max_bars : Maximum bars to hold before closing at market
+    df       : OHLCV DataFrame from data_loader.load_csv().
+    rr       : Risk-reward ratio (e.g. 2.0 = 1:2).
+    lookback : Bars on each side used to confirm a swing point (swing_n).
+               Smaller = more sensitive swings; larger = only major pivots.
+    max_bars : Maximum candles to hold a trade before force-closing.
 
     Returns
     -------
-    List of trade dicts, one per detected setup.
+    List of trade result dicts (see core.backtest.execute for schema).
     """
-    trades: list[dict] = []
-    skip_until: int = 0  # suppress overlapping signals within an active trade
+    min_required = lookback * 4 + 2
+    if len(df) < min_required:
+        return []
 
-    for i in range(lookback, len(df) - 1):
-        if i < skip_until:
-            continue
+    signals = generate_signals(df, rr=rr, swing_n=lookback)
 
-        direction = _classify(df, i, lookback)
-        if direction == "none":
-            continue
+    if not signals:
+        return []
 
-        c = df.iloc[i]
-        entry = round(float(c["Close"]), 2)
-
-        if direction == "long":
-            stop = round(float(c["Low"]) - _PIP, 2)
-            stop_dist = entry - stop
-            if stop_dist <= 0:
-                continue
-            target = round(entry + stop_dist * rr, 2)
-        else:
-            stop = round(float(c["High"]) + _PIP, 2)
-            stop_dist = stop - entry
-            if stop_dist <= 0:
-                continue
-            target = round(entry - stop_dist * rr, 2)
-
-        result, r_mult, bars = _simulate(
-            df, i + 1, entry, stop, target, direction, max_bars
-        )
-
-        # Resolved exit price
-        if result == "win":
-            exit_price = target
-        elif result == "loss":
-            exit_price = stop
-        else:
-            exit_price = round(float(df["Close"].iloc[min(i + bars, len(df) - 1)]), 2)
-
-        trades.append(
-            {
-                "date": str(df.index[i].date()),
-                "time": str(df.index[i].time()),
-                "direction": direction,
-                "entry": entry,
-                "stop": stop,
-                "target": target,
-                "exit_price": exit_price,
-                "result": result,
-                "r_multiple": r_mult,
-                "bars_held": bars,
-            }
-        )
-
-        # Don't stack signals during this trade's lifetime
-        skip_until = i + bars + 1
-
+    trades = backtest.execute(df, signals, max_trade_bars=max_bars)
     return trades

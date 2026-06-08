@@ -1,8 +1,14 @@
-"""MT5 OHLCV CSV loader.
+"""MT5 OHLCV CSV loader + validator.
 
-Expected format (tab or comma-separated):
+Expected format (comma or tab separated):
     Date,Time,Open,High,Low,Close,Volume
     2024.01.02,01:00,2063.45,2064.12,2062.80,2063.90,342
+
+Phase 2 additions:
+  - validate_dataframe() returns a structured validation report
+  - OHLC integrity checks (High >= Low, High >= Open/Close, etc.)
+  - Duplicate timestamp removal
+  - Minimum bar count enforcement
 """
 
 from __future__ import annotations
@@ -12,13 +18,17 @@ from pathlib import Path
 
 import pandas as pd
 
-
 _REQUIRED = {"date", "time", "open", "high", "low", "close", "volume"}
+_MIN_BARS = 60   # need enough history to form swing points
 
 
 def load_csv(source: str | Path | bytes | io.IOBase) -> pd.DataFrame:
-    """Parse an MT5 CSV export and return a clean OHLCV DataFrame indexed by Datetime."""
+    """
+    Parse an MT5 CSV export and return a clean OHLCV DataFrame.
 
+    Raises ValueError on unrecoverable parse failures.
+    Silently drops rows with non-numeric OHLCV or duplicate timestamps.
+    """
     if isinstance(source, (str, Path)):
         raw = pd.read_csv(source, sep=None, engine="python")
     elif isinstance(source, bytes):
@@ -26,25 +36,24 @@ def load_csv(source: str | Path | bytes | io.IOBase) -> pd.DataFrame:
     else:
         raw = pd.read_csv(source, sep=None, engine="python")
 
-    # Normalise column names
     raw.columns = [c.strip().lower() for c in raw.columns]
 
     missing = _REQUIRED - set(raw.columns)
     if missing:
         raise ValueError(
             f"CSV is missing required columns: {sorted(missing)}. "
-            f"Expected: Date, Time, Open, High, Low, Close, Volume"
+            "Expected: Date, Time, Open, High, Low, Close, Volume"
         )
 
-    # Build datetime index from Date + Time columns
-    # MT5 uses "2024.01.02" or "2024-01-02" date formats
+    # Build datetime index
     date_str = raw["date"].astype(str).str.replace(".", "-", regex=False)
     time_str = raw["time"].astype(str)
     raw["datetime"] = pd.to_datetime(date_str + " " + time_str, errors="coerce")
 
-    invalid = raw["datetime"].isna().sum()
-    if invalid == len(raw):
-        raise ValueError("Could not parse any datetime values — check Date/Time column format.")
+    if raw["datetime"].isna().all():
+        raise ValueError(
+            "Could not parse any datetime values — check Date/Time column format."
+        )
 
     df = (
         raw.set_index("datetime")
@@ -55,9 +64,100 @@ def load_csv(source: str | Path | bytes | io.IOBase) -> pd.DataFrame:
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df[~df.index.duplicated(keep="first")]
+    df = df.sort_index()
 
     if df.empty:
         raise ValueError("No valid OHLCV rows found after parsing.")
 
     return df
+
+
+def validate_dataframe(df: pd.DataFrame) -> dict:
+    """
+    Run quality checks on a loaded DataFrame.
+
+    Returns
+    -------
+    {
+        "valid"      : bool,
+        "row_count"  : int,
+        "date_range" : str,
+        "errors"     : list[str],   # blocks analysis
+        "warnings"   : list[str],   # informational only
+    }
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    row_count = len(df)
+
+    # ── Minimum rows ──────────────────────────────────────────────────────────
+    if row_count < _MIN_BARS:
+        errors.append(
+            f"Too few bars: {row_count} loaded (minimum {_MIN_BARS} required "
+            "to form swing points)."
+        )
+
+    # ── NaN / zero prices ─────────────────────────────────────────────────────
+    nan_counts = df[["Open", "High", "Low", "Close"]].isna().sum()
+    if nan_counts.any():
+        warnings.append(f"NaN values present: {nan_counts[nan_counts > 0].to_dict()}")
+
+    zero_rows = (df[["Open", "High", "Low", "Close"]] == 0).any(axis=1).sum()
+    if zero_rows:
+        warnings.append(f"{zero_rows} candles contain a zero price.")
+
+    # ── OHLC integrity ────────────────────────────────────────────────────────
+    tol = 1e-6
+    bad_high = (df["High"] < df[["Open", "Close"]].max(axis=1) - tol).sum()
+    bad_low  = (df["Low"]  > df[["Open", "Close"]].min(axis=1) + tol).sum()
+    bad_hl   = (df["High"] < df["Low"] - tol).sum()
+
+    if bad_hl:
+        errors.append(f"{bad_hl} candles where High < Low (corrupt data).")
+    if bad_high:
+        warnings.append(
+            f"{bad_high} candles where High < max(Open, Close) "
+            "(may indicate rounding in source data)."
+        )
+    if bad_low:
+        warnings.append(
+            f"{bad_low} candles where Low > min(Open, Close) "
+            "(may indicate rounding in source data)."
+        )
+
+    # ── Price range sanity (XAUUSD roughly 500–5000) ─────────────────────────
+    price_min = float(df["Close"].min())
+    price_max = float(df["Close"].max())
+    if price_min < 500 or price_max > 5_000:
+        warnings.append(
+            f"Unusual price range {price_min:.2f}–{price_max:.2f}. "
+            "Expected XAUUSD in the 500–5000 range."
+        )
+
+    # ── Duplicate timestamps ──────────────────────────────────────────────────
+    dups = df.index.duplicated().sum()
+    if dups:
+        warnings.append(f"{dups} duplicate timestamps were automatically removed.")
+
+    # ── Gaps (missing candles) ────────────────────────────────────────────────
+    if row_count >= 2:
+        diffs = df.index.to_series().diff().dropna()
+        median_gap = diffs.median()
+        large_gaps = (diffs > median_gap * 5).sum()
+        if large_gaps:
+            warnings.append(
+                f"{large_gaps} large time gaps detected (weekend/holiday gaps are normal)."
+            )
+
+    date_range = f"{df.index[0]}" if row_count == 0 else f"{df.index[0]} → {df.index[-1]}"
+
+    return {
+        "valid": len(errors) == 0,
+        "row_count": row_count,
+        "date_range": date_range,
+        "errors": errors,
+        "warnings": warnings,
+    }
