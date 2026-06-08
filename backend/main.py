@@ -1,12 +1,14 @@
 """
-XAUUSD Quant Research Platform — FastAPI Backend  (Phase 2)
-============================================================
+XAUUSD Quant Research Platform — FastAPI Backend  (Phase 2 + Multi-TF)
+=======================================================================
 Endpoints:
   GET  /health
   GET  /api/v1/modules
-  POST /api/v1/upload        Upload + validate MT5 CSV
-  POST /api/v1/analyze       Run module → report + export CSVs
-  GET  /api/v1/history       Recent analyses from SQLite
+  POST /api/v1/upload          Upload + validate single MT5 CSV
+  POST /api/v1/upload-multiple Merge multiple CSVs into one dataset
+  POST /api/v1/analyze         Run module → report + export CSVs
+                               Supports single-TF and multi-TF modes.
+  GET  /api/v1/history         Recent analyses from SQLite
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import io
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,9 +74,19 @@ app.add_middleware(
 
 # ── Request schema ─────────────────────────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
-    upload_id: str
+    # Single-TF mode (backward compat)
+    upload_id: Optional[str] = None
+
+    # Multi-TF mode
+    analysis_mode:     str                    = "single"  # "single" | "multi"
+    timeframe_uploads: Optional[dict[str, str]] = None   # {"H1": "uuid", ...}
+    trend_tf:          Optional[str]          = None
+    structure_tf:      Optional[str]          = None
+    entry_tf:          Optional[str]          = None
+
+    # Common parameters
     module:    str   = "liquidity_sweep"
-    timeframe: str   = "H1"
+    timeframe: str   = "H1"   # primary display / single-mode TF
     risk_pct:  float = Field(default=1.0,  ge=0.1,  le=10.0)
     rr:        float = Field(default=2.0,  ge=0.5,  le=10.0)
     lookback:  int   = Field(default=5,    ge=2,    le=20)
@@ -210,22 +223,88 @@ async def upload_multiple_csv(files: list[UploadFile] = File(...)):
 
 @app.post("/api/v1/analyze", tags=["Analysis"])
 def analyze(req: AnalyzeRequest):
-    upload = get_upload_by_id(req.upload_id)
-    if not upload:
-        raise HTTPException(status_code=404, detail="Upload not found.")
+    """
+    Run a strategy module on uploaded data.
 
-    try:
-        df = data_loader.load_csv(upload["filepath"])
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to reload data: {exc}")
+    Single-TF mode  (analysis_mode="single"): supply upload_id.
+    Multi-TF mode   (analysis_mode="multi"):  supply timeframe_uploads dict
+                                              and optionally trend/structure/entry_tf.
+    """
+    data_by_timeframe: dict = {}
+    primary_tf        = req.timeframe
+    upload_id_for_db  = req.upload_id or ""
+    export_filename   = "unknown"
+
+    # ── Load data ──────────────────────────────────────────────────────────────
+    if req.analysis_mode == "multi":
+        if not req.timeframe_uploads:
+            raise HTTPException(
+                status_code=400,
+                detail="timeframe_uploads is required for multi-timeframe mode.",
+            )
+
+        for tf, uid in req.timeframe_uploads.items():
+            upload = get_upload_by_id(uid)
+            if not upload:
+                raise HTTPException(
+                    status_code=404, detail=f"Upload not found for timeframe '{tf}'."
+                )
+            try:
+                data_by_timeframe[tf] = data_loader.load_csv(upload["filepath"])
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to load '{tf}' data: {exc}"
+                )
+
+        # Primary timeframe for sweep detection and reporting
+        primary_tf = req.structure_tf or next(iter(data_by_timeframe))
+        if primary_tf not in data_by_timeframe:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Structure timeframe '{primary_tf}' is not in uploaded data. "
+                    f"Available: {list(data_by_timeframe.keys())}"
+                ),
+            )
+
+        upload_id_for_db = req.timeframe_uploads.get(
+            primary_tf, next(iter(req.timeframe_uploads.values()))
+        )
+        export_filename = "multi_tf_" + "_".join(sorted(req.timeframe_uploads.keys()))
+
+    else:  # single-TF (backward compat)
+        if not req.upload_id:
+            raise HTTPException(
+                status_code=400,
+                detail="upload_id is required for single-timeframe mode.",
+            )
+        upload = get_upload_by_id(req.upload_id)
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload not found.")
+        try:
+            primary_df = data_loader.load_csv(upload["filepath"])
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to reload data: {exc}"
+            )
+        data_by_timeframe[req.timeframe] = primary_df
+        primary_tf       = req.timeframe
+        upload_id_for_db = req.upload_id
+        export_filename  = upload["filename"]
+
+    primary_df = data_by_timeframe[primary_tf]
 
     # ── Run strategy ───────────────────────────────────────────────────────────
     if req.module == "liquidity_sweep":
         trades = liquidity_sweep.run(
-            df,
+            primary_df,
             rr=req.rr,
             lookback=req.lookback,
             max_bars=req.max_bars,
+            data_by_timeframe=data_by_timeframe if req.analysis_mode == "multi" else None,
+            trend_tf=req.trend_tf,
+            structure_tf=req.structure_tf,
+            entry_tf=req.entry_tf,
         )
     else:
         raise HTTPException(status_code=400, detail=f"Unknown module: {req.module!r}")
@@ -234,22 +313,22 @@ def analyze(req: AnalyzeRequest):
     rpt = report_gen.generate(
         trades,
         req.risk_pct,
-        start_date=str(df.index[0]),
-        end_date=str(df.index[-1]),
+        start_date=str(primary_df.index[0]),
+        end_date=str(primary_df.index[-1]),
     )
 
     # ── Persist to SQLite ──────────────────────────────────────────────────────
     analysis_id = save_analysis(
-        req.upload_id, req.module, req.timeframe, req.risk_pct, req.rr, rpt
+        upload_id_for_db, req.module, primary_tf, req.risk_pct, req.rr, rpt
     )
 
     # ── Export CSVs ────────────────────────────────────────────────────────────
-    trade_log_path    = str(export.save_trade_log(trades, run_id=analysis_id))
-    summary_path      = str(export.save_research_summary(
+    trade_log_path = str(export.save_trade_log(trades, run_id=analysis_id))
+    summary_path   = str(export.save_research_summary(
         report=rpt,
         run_id=analysis_id,
-        filename=upload["filename"],
-        timeframe=req.timeframe,
+        filename=export_filename,
+        timeframe=primary_tf,
         module=req.module,
         risk_pct=req.risk_pct,
         rr=req.rr,
@@ -263,20 +342,25 @@ def analyze(req: AnalyzeRequest):
     ]
 
     return {
-        "analysis_id": analysis_id,
-        "symbol":      "XAUUSD",
-        "module":      req.module,
-        "timeframe":   req.timeframe,
-        "parameters":  {
+        "analysis_id":     analysis_id,
+        "symbol":          "XAUUSD",
+        "module":          req.module,
+        "analysis_mode":   req.analysis_mode,
+        "timeframe":       primary_tf,
+        "timeframes_used": list(data_by_timeframe.keys()),
+        "structure_tf":    req.structure_tf,
+        "entry_tf":        req.entry_tf,
+        "trend_tf":        req.trend_tf,
+        "parameters":      {
             "risk_pct": req.risk_pct,
             "rr":       req.rr,
             "lookback": req.lookback,
         },
-        "trades":      clean_trades,
-        "report":      rpt,
-        "exports":     {
-            "trade_log":         trade_log_path,
-            "research_summary":  summary_path,
+        "trades":  clean_trades,
+        "report":  rpt,
+        "exports": {
+            "trade_log":        trade_log_path,
+            "research_summary": summary_path,
         },
     }
 

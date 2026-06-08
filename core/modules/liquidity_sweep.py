@@ -188,17 +188,25 @@ def run(
     rr: float = 2.0,
     lookback: int = 5,
     max_bars: int = 200,
+    data_by_timeframe: dict | None = None,
+    trend_tf: str | None = None,
+    structure_tf: str | None = None,
+    entry_tf: str | None = None,
 ) -> list[dict]:
     """
     Full pipeline: detect sweeps → execute via backtest engine → return trades.
 
     Parameters
     ----------
-    df       : OHLCV DataFrame from data_loader.load_csv().
-    rr       : Risk-reward ratio (e.g. 2.0 = 1:2).
-    lookback : Bars on each side used to confirm a swing point (swing_n).
-               Smaller = more sensitive swings; larger = only major pivots.
-    max_bars : Maximum candles to hold a trade before force-closing.
+    df                 : Primary OHLCV DataFrame (structure or single TF).
+    rr                 : Risk-reward ratio (e.g. 2.0 = 1:2).
+    lookback           : Bars on each side to confirm a swing point.
+    max_bars           : Maximum candles to hold a trade before force-closing.
+    data_by_timeframe  : Optional dict of {tf: df} for multi-TF context.
+                         Available for future trend-filter expansion.
+    trend_tf           : Key in data_by_timeframe used as trend context.
+    structure_tf       : Key in data_by_timeframe used for sweep detection (=df).
+    entry_tf           : Key in data_by_timeframe for entry refinement.
 
     Returns
     -------

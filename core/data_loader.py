@@ -185,6 +185,29 @@ def combine_dataframes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     return combined
 
 
+# ── Timeframe detection ───────────────────────────────────────────────────────
+
+_KNOWN_TF = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN"]
+
+
+def detect_timeframe(filename: str) -> str | None:
+    """
+    Detect the timeframe label from an MT5 export filename.
+
+    Supports: XAUUSD_M1_OHLCV.csv → M1
+              XAUUSD_H4_OHLCV.csv → H4
+              GOLD-D1-DATA.csv    → D1
+
+    Returns None when no recognised timeframe token is found.
+    """
+    import re
+    stem = re.sub(r"[\s\-\.]", "_", Path(filename).stem.upper())
+    for tf in sorted(_KNOWN_TF, key=len, reverse=True):  # longest first (M15 before M1)
+        if re.search(r"(?:^|_)" + re.escape(tf) + r"(?:_|$)", stem):
+            return tf
+    return None
+
+
 def save_dataframe(df: pd.DataFrame, path: "Path") -> None:
     """
     Write a DataFrame back to MT5 CSV format so load_csv() can reload it.
