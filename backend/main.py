@@ -52,6 +52,7 @@ from core import report as report_gen
 from core.modules import liquidity_sweep
 from database import db
 from database.db import (
+    dataset_exists,
     delete_dataset,
     delete_research_run,
     get_dataset_by_hash,
@@ -349,6 +350,11 @@ def analyze(req: AnalyzeRequest):
       1. dataset_id  / dataset_ids   — load from SQLite ohlcv_candles
       2. upload_id   / timeframe_uploads — load from uploaded file (legacy)
     """
+    print("[analyze] ──────────────────────────────────────────────", flush=True)
+    print(f"[analyze] module={req.module}  mode={req.analysis_mode}  sub_mode={req.analysis_sub_mode}", flush=True)
+    print(f"[analyze] dataset_id={req.dataset_id}  dataset_ids={req.dataset_ids}", flush=True)
+    print(f"[analyze] backtest_start={req.backtest_start}  backtest_end={req.backtest_end}", flush=True)
+
     data_by_timeframe: dict = {}
     primary_tf        = req.timeframe
     dataset_ids_used: dict[str, str] = {}
@@ -432,6 +438,16 @@ def analyze(req: AnalyzeRequest):
 
     primary_df = data_by_timeframe[primary_tf]
 
+    # ── Validate stored dataset IDs still exist in DB ─────────────────────────
+    print(f"[analyze] dataset_ids_used={dataset_ids_used}", flush=True)
+    for _tf, _did in dataset_ids_used.items():
+        if not dataset_exists(_did):
+            raise HTTPException(
+                400,
+                f"Selected dataset does not exist. Please select a valid stored dataset. "
+                f"(TF={_tf}, dataset_id={_did})",
+            )
+
     # ── Apply backtest date range filter ──────────────────────────────────────
     if req.backtest_start or req.backtest_end:
         for _tf_key in list(data_by_timeframe.keys()):
@@ -502,6 +518,8 @@ def analyze(req: AnalyzeRequest):
             backtest_end=req.backtest_end,
             analysis_sub_mode=req.analysis_sub_mode,
         )
+
+        print(f"[analyze] research_id={research_id}  trades={len(clean_trades)}  monthly={len(rpt.get('monthly_breakdown', []))}", flush=True)
 
         # ── Legacy analysis record (backward compat with /api/v1/history) ─────
         legacy_uid = (
