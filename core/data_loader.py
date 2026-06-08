@@ -190,6 +190,28 @@ def combine_dataframes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
 _KNOWN_TF = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN"]
 
 
+def load_from_dataset_id(dataset_id: str) -> pd.DataFrame:
+    """
+    Load OHLCV candles stored in SQLite for a given dataset_id.
+
+    Returns a clean DataFrame with DatetimeIndex, same shape as load_csv().
+    Raises ValueError if no candles are found.
+    """
+    from database.db import get_dataset_candles  # late import to avoid circular dep
+
+    candles = get_dataset_candles(dataset_id)
+    if not candles:
+        raise ValueError(f"No candles found in database for dataset_id={dataset_id!r}")
+
+    df = pd.DataFrame(candles, columns=["dt", "open", "high", "low", "close", "volume"])
+    df["dt"] = pd.to_datetime(df["dt"])
+    df = df.set_index("dt")
+    df.index.name = "datetime"
+    df.columns = [c.capitalize() for c in df.columns]
+    df = df.sort_index()
+    return df
+
+
 def detect_timeframe(filename: str) -> str | None:
     """
     Detect the timeframe label from an MT5 export filename.
