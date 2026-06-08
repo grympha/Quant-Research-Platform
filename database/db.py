@@ -44,6 +44,9 @@ def _connect():
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         conn.execute("BEGIN")
+        # Defer FK checks to COMMIT time so parent + child rows can both be
+        # inserted in one transaction before any constraint is evaluated.
+        conn.execute("PRAGMA defer_foreign_keys = ON")
         yield conn
         conn.execute("COMMIT")
     except Exception:
