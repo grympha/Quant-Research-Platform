@@ -68,6 +68,7 @@ from database.db import (
     save_dataset_metadata,
     save_monthly_reports,
     save_research_run,
+    save_research_run_complete,
     save_trade_logs,
     save_upload,
 )
@@ -451,8 +452,13 @@ def analyze(req: AnalyzeRequest):
         # Sanitise: replace any non-finite floats before JSON serialisation
         rpt = _sanitise_report(rpt)
 
-        # ── Persist research run ───────────────────────────────────────────────
-        research_id = save_research_run(
+        # ── Persist research run + trades + monthly in one atomic transaction ──
+        clean_trades = [
+            {k: v for k, v in t.items() if not k.startswith("_")}
+            for t in trades
+        ]
+
+        research_id = save_research_run_complete(
             research_name=req.research_name,
             selected_module=req.module,
             symbol="XAUUSD",
@@ -463,15 +469,9 @@ def analyze(req: AnalyzeRequest):
             reward_risk_ratio=req.rr,
             lookback=req.lookback,
             report=rpt,
+            trades=clean_trades,
+            monthly_breakdown=rpt.get("monthly_breakdown", []),
         )
-
-        clean_trades = [
-            {k: v for k, v in t.items() if not k.startswith("_")}
-            for t in trades
-        ]
-
-        save_trade_logs(research_id, clean_trades)
-        save_monthly_reports(research_id, rpt.get("monthly_breakdown", []))
 
         # ── Legacy analysis record (backward compat with /api/v1/history) ─────
         legacy_uid = (

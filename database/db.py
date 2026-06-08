@@ -335,6 +335,96 @@ def save_research_run(
     return rid
 
 
+def save_research_run_complete(
+    research_name: str | None,
+    selected_module: str,
+    symbol: str,
+    timeframe_mode: str,
+    timeframes_used: list[str],
+    dataset_ids_used: dict,
+    risk_percent: float,
+    reward_risk_ratio: float,
+    lookback: int,
+    report: dict,
+    trades: list[dict],
+    monthly_breakdown: list[dict],
+) -> str:
+    """
+    Save research_run + trade_logs + monthly_reports in one atomic transaction.
+
+    Avoids FK constraint failures that occur when the three operations use
+    separate connections — the parent row must exist in the same transaction
+    before SQLite validates the child FK references.
+    """
+    rid = str(uuid.uuid4())
+    with _connect() as conn:
+        # 1. Parent row
+        conn.execute(
+            """INSERT INTO research_runs (
+                research_id, created_datetime, research_name,
+                selected_module, symbol, timeframe_mode,
+                timeframes_used, dataset_ids_used,
+                risk_percent, reward_risk_ratio, lookback,
+                total_trades, wins, losses, win_rate,
+                profit_factor, net_r, monthly_return,
+                max_drawdown, goal_status, full_report, status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                rid, _now(),
+                research_name or f"Run {rid[:8]}",
+                selected_module, symbol, timeframe_mode,
+                json.dumps(timeframes_used),
+                json.dumps(dataset_ids_used),
+                risk_percent, reward_risk_ratio, lookback,
+                report.get("total_trades", 0),
+                report.get("win_trades", 0),
+                report.get("loss_trades", 0),
+                report.get("win_rate", 0.0),
+                report.get("profit_factor", 0.0),
+                report.get("net_r", 0.0),
+                report.get("monthly_return", 0.0),
+                report.get("max_drawdown", 0.0),
+                report.get("goal_status", "INSUFFICIENT DATA"),
+                json.dumps(report),
+                "completed",
+            ),
+        )
+
+        # 2. Trade logs (FK: research_id → research_runs — parent row above already in tx)
+        if trades:
+            conn.executemany(
+                """INSERT INTO trade_logs
+                   (research_id, date, time, direction, swept_level, entry, sl, tp,
+                    exit_price, result, r_multiple, bars_held)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        rid,
+                        t.get("date"), t.get("time"), t.get("direction"),
+                        t.get("swept_level"), t.get("entry"), t.get("sl"), t.get("tp"),
+                        t.get("exit_price"), t.get("result"),
+                        t.get("r_multiple"), t.get("bars_held"),
+                    )
+                    for t in trades
+                ],
+            )
+
+        # 3. Monthly breakdown (FK: research_id → research_runs)
+        if monthly_breakdown:
+            conn.executemany(
+                "INSERT INTO monthly_reports "
+                "(research_id, month, trades, wins, losses, net_r, return_pct) "
+                "VALUES (?,?,?,?,?,?,?)",
+                [
+                    (rid, b["month"], b["trades"], b["wins"],
+                     b["losses"], b["net_r"], b["return_pct"])
+                    for b in monthly_breakdown
+                ],
+            )
+
+    return rid
+
+
 def list_research_runs(limit: int = 100) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
