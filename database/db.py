@@ -27,16 +27,30 @@ DB_PATH = Path(__file__).parent.parent / "data" / "quant.db"
 
 @contextmanager
 def _connect():
+    """
+    Open a SQLite connection with explicit transaction management.
+
+    isolation_level=None puts Python's sqlite3 in autocommit mode so it never
+    issues implicit BEGIN/COMMIT/ROLLBACK around our statements.  We then issue
+    an explicit BEGIN ourselves, guaranteeing that every INSERT (including
+    parent + child FK pairs) runs inside *one* transaction and SQLite's FK
+    checker can see uncommitted parent rows from the same transaction.
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    # PRAGMAs must be set outside any transaction.
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
+        conn.execute("BEGIN")
         yield conn
-        conn.commit()
+        conn.execute("COMMIT")
     except Exception:
-        conn.rollback()
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
