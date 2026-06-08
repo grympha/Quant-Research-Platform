@@ -34,6 +34,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -294,6 +296,40 @@ def export_dataset(dataset_id: str):
     )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sanitise_float(v: object) -> object:
+    """Replace nan/inf with JSON-safe values."""
+    if isinstance(v, float):
+        if math.isnan(v):
+            return 0.0
+        if math.isinf(v):
+            return 999.0 if v > 0 else -999.0
+    return v
+
+
+def _sanitise_report(rpt: dict) -> dict:
+    """Walk the report dict and replace any non-finite floats."""
+    out: dict = {}
+    for k, v in rpt.items():
+        if isinstance(v, float):
+            out[k] = _sanitise_float(v)
+        elif isinstance(v, list):
+            sanitised_list = []
+            for item in v:
+                if isinstance(item, dict):
+                    sanitised_list.append({ik: _sanitise_float(iv) for ik, iv in item.items()})
+                else:
+                    sanitised_list.append(_sanitise_float(item))
+            out[k] = sanitised_list
+        elif isinstance(v, dict):
+            out[k] = {ik: (_sanitise_float(iv) if isinstance(iv, float) else iv)
+                      for ik, iv in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/analyze", tags=["Analysis"])
@@ -388,88 +424,99 @@ def analyze(req: AnalyzeRequest):
 
     primary_df = data_by_timeframe[primary_tf]
 
-    # ── Run strategy ───────────────────────────────────────────────────────────
-    if req.module == "liquidity_sweep":
-        trades = liquidity_sweep.run(
-            primary_df,
-            rr=req.rr,
-            lookback=req.lookback,
-            max_bars=req.max_bars,
-            data_by_timeframe=data_by_timeframe if req.analysis_mode == "multi" else None,
-            trend_tf=req.trend_tf,
-            structure_tf=req.structure_tf,
-            entry_tf=req.entry_tf,
+    try:
+        # ── Run strategy ───────────────────────────────────────────────────────
+        if req.module == "liquidity_sweep":
+            trades = liquidity_sweep.run(
+                primary_df,
+                rr=req.rr,
+                lookback=req.lookback,
+                max_bars=req.max_bars,
+                data_by_timeframe=data_by_timeframe if req.analysis_mode == "multi" else None,
+                trend_tf=req.trend_tf,
+                structure_tf=req.structure_tf,
+                entry_tf=req.entry_tf,
+            )
+        else:
+            raise HTTPException(400, f"Unknown module: {req.module!r}")
+
+        # ── Generate report ────────────────────────────────────────────────────
+        rpt = report_gen.generate(
+            trades,
+            req.risk_pct,
+            start_date=str(primary_df.index[0]),
+            end_date=str(primary_df.index[-1]),
         )
-    else:
-        raise HTTPException(400, f"Unknown module: {req.module!r}")
 
-    # ── Generate report ────────────────────────────────────────────────────────
-    rpt = report_gen.generate(
-        trades,
-        req.risk_pct,
-        start_date=str(primary_df.index[0]),
-        end_date=str(primary_df.index[-1]),
-    )
+        # Sanitise: replace any non-finite floats before JSON serialisation
+        rpt = _sanitise_report(rpt)
 
-    # ── Persist research run ───────────────────────────────────────────────────
-    research_id = save_research_run(
-        research_name=req.research_name,
-        selected_module=req.module,
-        symbol="XAUUSD",
-        timeframe_mode=req.analysis_mode,
-        timeframes_used=list(data_by_timeframe.keys()),
-        dataset_ids_used=dataset_ids_used,
-        risk_percent=req.risk_pct,
-        reward_risk_ratio=req.rr,
-        lookback=req.lookback,
-        report=rpt,
-    )
+        # ── Persist research run ───────────────────────────────────────────────
+        research_id = save_research_run(
+            research_name=req.research_name,
+            selected_module=req.module,
+            symbol="XAUUSD",
+            timeframe_mode=req.analysis_mode,
+            timeframes_used=list(data_by_timeframe.keys()),
+            dataset_ids_used=dataset_ids_used,
+            risk_percent=req.risk_pct,
+            reward_risk_ratio=req.rr,
+            lookback=req.lookback,
+            report=rpt,
+        )
 
-    clean_trades = [
-        {k: v for k, v in t.items() if not k.startswith("_")}
-        for t in trades
-    ]
+        clean_trades = [
+            {k: v for k, v in t.items() if not k.startswith("_")}
+            for t in trades
+        ]
 
-    save_trade_logs(research_id, clean_trades)
-    save_monthly_reports(research_id, rpt.get("monthly_breakdown", []))
+        save_trade_logs(research_id, clean_trades)
+        save_monthly_reports(research_id, rpt.get("monthly_breakdown", []))
 
-    # ── Legacy analysis record (backward compat with /api/v1/history) ─────────
-    legacy_uid = (
-        req.upload_id
-        or (next(iter(req.timeframe_uploads.values())) if req.timeframe_uploads else None)
-        or research_id
-    )
-    legacy_aid = save_analysis(legacy_uid, req.module, primary_tf, req.risk_pct, req.rr, rpt)
+        # ── Legacy analysis record (backward compat with /api/v1/history) ─────
+        legacy_uid = (
+            req.upload_id
+            or (next(iter(req.timeframe_uploads.values())) if req.timeframe_uploads else None)
+            or research_id
+        )
+        legacy_aid = save_analysis(legacy_uid, req.module, primary_tf, req.risk_pct, req.rr, rpt)
 
-    # ── Append-mode CSV exports ────────────────────────────────────────────────
-    trade_log_path = str(export.save_trade_log(clean_trades, run_id=research_id))
-    summary_path   = str(export.save_research_summary(
-        report=rpt, run_id=research_id, filename=export_filename,
-        timeframe=primary_tf, module=req.module,
-        risk_pct=req.risk_pct, rr=req.rr, lookback=req.lookback,
-    ))
+        # ── Append-mode CSV exports ────────────────────────────────────────────
+        trade_log_path = str(export.save_trade_log(clean_trades, run_id=research_id))
+        summary_path   = str(export.save_research_summary(
+            report=rpt, run_id=research_id, filename=export_filename,
+            timeframe=primary_tf, module=req.module,
+            risk_pct=req.risk_pct, rr=req.rr, lookback=req.lookback,
+        ))
 
-    # ── Per-research file exports ──────────────────────────────────────────────
-    result_payload = {
-        "research_id":     research_id,
-        "analysis_id":     legacy_aid,
-        "symbol":          "XAUUSD",
-        "module":          req.module,
-        "analysis_mode":   req.analysis_mode,
-        "timeframe":       primary_tf,
-        "timeframes_used": list(data_by_timeframe.keys()),
-        "structure_tf":    req.structure_tf,
-        "entry_tf":        req.entry_tf,
-        "trend_tf":        req.trend_tf,
-        "parameters":      {"risk_pct": req.risk_pct, "rr": req.rr, "lookback": req.lookback},
-        "trades":          clean_trades,
-        "report":          rpt,
-        "exports":         {"trade_log": trade_log_path, "research_summary": summary_path},
-    }
-    per_run_paths = export.save_per_research_exports(research_id, result_payload)
-    result_payload["exports"].update({k: str(v) for k, v in per_run_paths.items()})
+        # ── Per-research file exports ──────────────────────────────────────────
+        result_payload = {
+            "research_id":     research_id,
+            "analysis_id":     legacy_aid,
+            "symbol":          "XAUUSD",
+            "module":          req.module,
+            "analysis_mode":   req.analysis_mode,
+            "timeframe":       primary_tf,
+            "timeframes_used": list(data_by_timeframe.keys()),
+            "structure_tf":    req.structure_tf,
+            "entry_tf":        req.entry_tf,
+            "trend_tf":        req.trend_tf,
+            "parameters":      {"risk_pct": req.risk_pct, "rr": req.rr, "lookback": req.lookback},
+            "trades":          clean_trades,
+            "report":          rpt,
+            "exports":         {"trade_log": trade_log_path, "research_summary": summary_path},
+        }
+        per_run_paths = export.save_per_research_exports(research_id, result_payload)
+        result_payload["exports"].update({k: str(v) for k, v in per_run_paths.items()})
 
-    return result_payload
+        return result_payload
+
+    except HTTPException:
+        raise  # re-raise expected HTTP errors as-is
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[analyze] UNHANDLED ERROR:\n{tb}", flush=True)
+        raise HTTPException(500, detail=f"{type(exc).__name__}: {exc}")
 
 
 # ── Research History ──────────────────────────────────────────────────────────

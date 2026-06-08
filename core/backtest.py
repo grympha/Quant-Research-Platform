@@ -75,9 +75,17 @@ def execute(
 
         r_mult = _calc_r(fill_price, sl, exit_price, direction)
 
+        ts = df.index[entry_bar]
+        try:
+            bar_date = str(ts.date())
+            bar_time = str(ts.time())
+        except Exception:
+            bar_date = str(ts)[:10]
+            bar_time = str(ts)[11:19] if len(str(ts)) > 10 else "00:00:00"
+
         trades.append({
-            "date":        str(df.index[entry_bar].date()),
-            "time":        str(df.index[entry_bar].time()),
+            "date":        bar_date,
+            "time":        bar_time,
             "direction":   direction,
             "swept_level": round(sig["swept_level"], 2),
             "entry":       round(fill_price, 2),
