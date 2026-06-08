@@ -26,7 +26,7 @@ GOAL_MR_MAX = 5.0
 GOAL_DD_LIM = 4.0
 GOAL_PF_MIN = 1.5
 
-TF_ALL   = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
+TF_ALL   = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
 TF_ORDER = {tf: i for i, tf in enumerate(TF_ALL)}
 
 _STATUS_CLASS = {

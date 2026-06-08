@@ -187,7 +187,7 @@ def combine_dataframes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
 
 # ── Timeframe detection ───────────────────────────────────────────────────────
 
-_KNOWN_TF = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN"]
+_KNOWN_TF = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1", "MN"]
 
 
 def load_from_dataset_id(dataset_id: str) -> pd.DataFrame:
