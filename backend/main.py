@@ -40,6 +40,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -138,6 +140,11 @@ class AnalyzeRequest(BaseModel):
     lookback:      int   = Field(default=5,    ge=2,   le=20)
     max_bars:      int   = Field(default=200,  ge=10,  le=500)
     research_name: Optional[str] = None
+
+    # ── Date range + analysis sub-mode ────────────────────────────────────────
+    backtest_start:    Optional[str] = None   # "YYYY-MM-DD"
+    backtest_end:      Optional[str] = None   # "YYYY-MM-DD"
+    analysis_sub_mode: str           = "full_backtest"
 
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -425,6 +432,26 @@ def analyze(req: AnalyzeRequest):
 
     primary_df = data_by_timeframe[primary_tf]
 
+    # ── Apply backtest date range filter ──────────────────────────────────────
+    if req.backtest_start or req.backtest_end:
+        for _tf_key in list(data_by_timeframe.keys()):
+            _df = data_by_timeframe[_tf_key]
+            try:
+                if req.backtest_start:
+                    _df = _df[_df.index >= pd.Timestamp(req.backtest_start)]
+                if req.backtest_end:
+                    _df = _df[_df.index < pd.Timestamp(req.backtest_end) + pd.Timedelta(days=1)]
+            except Exception as exc:
+                raise HTTPException(400, f"Invalid date range: {exc}")
+            if _df.empty:
+                raise HTTPException(
+                    400,
+                    f"No data for '{_tf_key}' in range "
+                    f"{req.backtest_start or 'start'} → {req.backtest_end or 'end'}.",
+                )
+            data_by_timeframe[_tf_key] = _df
+        primary_df = data_by_timeframe[primary_tf]
+
     try:
         # ── Run strategy ───────────────────────────────────────────────────────
         if req.module == "liquidity_sweep":
@@ -471,6 +498,9 @@ def analyze(req: AnalyzeRequest):
             report=rpt,
             trades=clean_trades,
             monthly_breakdown=rpt.get("monthly_breakdown", []),
+            backtest_start=req.backtest_start,
+            backtest_end=req.backtest_end,
+            analysis_sub_mode=req.analysis_sub_mode,
         )
 
         # ── Legacy analysis record (backward compat with /api/v1/history) ─────
@@ -491,20 +521,23 @@ def analyze(req: AnalyzeRequest):
 
         # ── Per-research file exports ──────────────────────────────────────────
         result_payload = {
-            "research_id":     research_id,
-            "analysis_id":     legacy_aid,
-            "symbol":          "XAUUSD",
-            "module":          req.module,
-            "analysis_mode":   req.analysis_mode,
-            "timeframe":       primary_tf,
-            "timeframes_used": list(data_by_timeframe.keys()),
-            "structure_tf":    req.structure_tf,
-            "entry_tf":        req.entry_tf,
-            "trend_tf":        req.trend_tf,
-            "parameters":      {"risk_pct": req.risk_pct, "rr": req.rr, "lookback": req.lookback},
-            "trades":          clean_trades,
-            "report":          rpt,
-            "exports":         {"trade_log": trade_log_path, "research_summary": summary_path},
+            "research_id":      research_id,
+            "analysis_id":      legacy_aid,
+            "symbol":           "XAUUSD",
+            "module":           req.module,
+            "analysis_mode":    req.analysis_mode,
+            "analysis_sub_mode": req.analysis_sub_mode,
+            "backtest_start":   req.backtest_start,
+            "backtest_end":     req.backtest_end,
+            "timeframe":        primary_tf,
+            "timeframes_used":  list(data_by_timeframe.keys()),
+            "structure_tf":     req.structure_tf,
+            "entry_tf":         req.entry_tf,
+            "trend_tf":         req.trend_tf,
+            "parameters":       {"risk_pct": req.risk_pct, "rr": req.rr, "lookback": req.lookback},
+            "trades":           clean_trades,
+            "report":           rpt,
+            "exports":          {"trade_log": trade_log_path, "research_summary": summary_path},
         }
         per_run_paths = export.save_per_research_exports(research_id, result_payload)
         result_payload["exports"].update({k: str(v) for k, v in per_run_paths.items()})

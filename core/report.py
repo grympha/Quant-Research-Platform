@@ -53,6 +53,7 @@ _EMPTY_REPORT: dict[str, Any] = {
     "goal_detail":       {},
     "goals":             GOALS,
     "equity_curve":      [0.0],
+    "drawdown_curve":    [0.0],
     "monthly_breakdown": [],
 }
 
@@ -101,15 +102,17 @@ def generate(
     for t in sorted_closed:
         equity.append(round(equity[-1] + t["r_multiple"] * risk_pct, 4))
 
-    # ── Max drawdown ─────────────────────────────────────────────────────────
-    peak   = 0.0
-    max_dd = 0.0
+    # ── Max drawdown + drawdown curve ────────────────────────────────────────
+    peak     = 0.0
+    max_dd   = 0.0
+    dd_curve: list[float] = []
     for val in equity:
         if val > peak:
             peak = val
-        dd = peak - val
+        dd = max(peak - val, 0.0)
         if dd > max_dd:
             max_dd = dd
+        dd_curve.append(round(dd, 4))
 
     # ── Monthly return ────────────────────────────────────────────────────────
     months         = _calc_months(sorted_closed, start_date, end_date)
@@ -159,6 +162,7 @@ def generate(
         "goal_detail":       goal_detail,
         "goals":             GOALS,
         "equity_curve":      equity,
+        "drawdown_curve":    dd_curve,
         "monthly_breakdown": monthly_breakdown,
     }
 

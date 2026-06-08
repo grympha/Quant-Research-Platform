@@ -165,6 +165,17 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_monthly_research  ON monthly_reports(research_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_hash     ON datasets(file_hash)")
 
+        # ── Schema migrations (safe for existing databases) ───────────────────
+        for _col_sql in [
+            "ALTER TABLE research_runs ADD COLUMN backtest_start    TEXT",
+            "ALTER TABLE research_runs ADD COLUMN backtest_end      TEXT",
+            "ALTER TABLE research_runs ADD COLUMN analysis_sub_mode TEXT DEFAULT 'full_backtest'",
+        ]:
+            try:
+                conn.execute(_col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
 
 # ── Legacy helpers (unchanged for backward compat) ────────────────────────────
 
@@ -348,6 +359,9 @@ def save_research_run_complete(
     report: dict,
     trades: list[dict],
     monthly_breakdown: list[dict],
+    backtest_start: str | None = None,
+    backtest_end: str | None = None,
+    analysis_sub_mode: str = "full_backtest",
 ) -> str:
     """
     Save research_run + trade_logs + monthly_reports in one atomic transaction.
@@ -367,8 +381,9 @@ def save_research_run_complete(
                 risk_percent, reward_risk_ratio, lookback,
                 total_trades, wins, losses, win_rate,
                 profit_factor, net_r, monthly_return,
-                max_drawdown, goal_status, full_report, status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                max_drawdown, goal_status, full_report, status,
+                backtest_start, backtest_end, analysis_sub_mode
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 rid, _now(),
                 research_name or f"Run {rid[:8]}",
@@ -387,6 +402,9 @@ def save_research_run_complete(
                 report.get("goal_status", "INSUFFICIENT DATA"),
                 json.dumps(report),
                 "completed",
+                backtest_start,
+                backtest_end,
+                analysis_sub_mode,
             ),
         )
 
