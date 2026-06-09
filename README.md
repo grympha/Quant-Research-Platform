@@ -1,9 +1,16 @@
-# XAUUSD Quant Research Platform
+# Quant Research Platform
 
-**Phase 1.5 — Stability & Validation**
+**Phase 2 — Break & Retest Module + Module Comparison Dashboard**
 
-A persistent backtesting platform for the Liquidity Sweep strategy on XAUUSD.
+A persistent backtesting platform for XAUUSD strategy research.
 Stores OHLCV datasets and research history in SQLite so every run is reusable.
+
+## Strategy Modules
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| Liquidity Sweep | Phase 2 | Sweep of swing high/low with rejection candle confirmation |
+| Break & Retest | Phase 2 | Break above/below swing level, retest, bullish/bearish confirmation |
 
 ---
 
@@ -195,6 +202,68 @@ data/
   exports/              All CSV/JSON export files
   uploads/              Legacy uploaded CSV files
 ```
+
+---
+
+## Break & Retest Strategy
+
+### Logic
+```
+BUY SETUP:
+  1. Confirmed swing HIGH at resistance level R (N bars each side).
+  2. A candle closes above R + breakout_buffer  → breakout active.
+  3. A later candle: Low touches R (within retest_tolerance),
+     bullish body (Close > Open), Close > R  → retest + confirmation.
+  4. Entry: next candle Open.
+  5. SL: confirmation candle Low - 0.20 (buffer).
+  6. TP: entry + (entry - SL) × rr.
+
+SELL SETUP:
+  1. Confirmed swing LOW at support level S.
+  2. A candle closes below S - breakout_buffer  → breakout active.
+  3. A later candle: High touches S (within retest_tolerance),
+     bearish body (Close < Open), Close < S  → retest + confirmation.
+  4. Entry: next candle Open.
+  5. SL: confirmation candle High + 0.20 (buffer).
+  6. TP: entry - (SL - entry) × rr.
+```
+
+### No-Lookahead Guarantee
+- Swing at bar j is confirmed at bar j + swing_n. Only swings with j + swing_n ≤ i are used at bar i.
+- Breakout, retest, and confirmation all use OHLC data from bars ≤ i.
+- Entry always fills at Open of bar i+1.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| swing_lookback | 5 | Bars each side to confirm a swing point |
+| breakout_buffer | 0.10 | Min price distance beyond level for breakout close |
+| retest_tolerance | 0.50 | Max distance between retest wick and broken level |
+| rr | 2.0 | Risk-reward ratio for TP |
+| risk_pct | 1.0 | Risk per trade as % of account |
+
+---
+
+## Module Comparison Dashboard
+
+The **Compare Modules** tab runs both modules on the same dataset simultaneously and displays:
+
+- Side-by-side metrics table (Trades, Win Rate, PF, Net R, Monthly Return, Max DD, Goal Status)
+- Automatic winner call-out for PF, Monthly Return, and Drawdown
+- Per-module detailed results (equity curve, drawdown chart, monthly breakdown, trades, goals)
+- Download as `module_comparison.csv`
+- Both runs saved to Research History for later reference
+
+### How to run a comparison
+1. Go to **Compare Modules** tab.
+2. Select a dataset (single TF or multi-TF).
+3. Set date range and shared parameters (Risk %, RR, Swing N).
+4. Set Break & Retest specific params (Breakout Buffer, Retest Tolerance).
+5. Select which modules to include (default: both).
+6. Click **Run Comparison**.
+
+The comparison CSV is also appended to `data/exports/module_comparison.csv` with a timestamp.
 
 ---
 

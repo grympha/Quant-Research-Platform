@@ -97,8 +97,10 @@ with st.sidebar:
 
     st.subheader("Module")
     module = st.selectbox(
-        "module", ["liquidity_sweep"],
-        format_func=lambda x: "Liquidity Sweep",
+        "module",
+        ["liquidity_sweep", "break_retest"],
+        format_func=lambda x: {"liquidity_sweep": "Liquidity Sweep",
+                                "break_retest":   "Break & Retest"}.get(x, x),
         label_visibility="collapsed",
     )
 
@@ -114,6 +116,25 @@ with st.sidebar:
     lookback = st.slider("lookback", 2, 20, 5, 1,
                          label_visibility="collapsed",
                          help="Higher = only major pivots; lower = more sensitive swings.")
+
+    # Break & Retest specific params (shown only when that module is selected)
+    breakout_buffer  = 0.10
+    retest_tolerance = 0.50
+    if module == "break_retest":
+        st.divider()
+        st.subheader("Break & Retest Params")
+        breakout_buffer = st.slider(
+            "Breakout Buffer (price units)",
+            min_value=0.0, max_value=2.0, value=0.10, step=0.05,
+            key="breakout_buffer",
+            help="Minimum distance the close must exceed the swing level to register a breakout.",
+        )
+        retest_tolerance = st.slider(
+            "Retest Tolerance (price units)",
+            min_value=0.0, max_value=2.0, value=0.50, step=0.05,
+            key="retest_tolerance",
+            help="How close the retest wick must get to the broken level.",
+        )
 
     st.divider()
     st.markdown("**🎯 Target Goals**")
@@ -477,12 +498,13 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "▶ Run Analysis",
     "📂 Dataset Library",
     "🕒 Research History",
     "📤 Export Center",
     "🏥 Platform Health",
+    "⚖️ Compare Modules",
 ])
 
 
@@ -971,6 +993,8 @@ with tab1:
                 "risk_pct":          risk_pct,
                 "rr":                rr,
                 "lookback":          lookback,
+                "breakout_buffer":   breakout_buffer,
+                "retest_tolerance":  retest_tolerance,
                 "research_name":     (research_name + name_suffix) if research_name else (
                     name_suffix.strip() or None
                 ),
@@ -1649,3 +1673,245 @@ with tab5:
                 st.error(f"Reset failed ({rr.status_code}): {rr.text}")
         except Exception as exc:
             st.error(f"Connection error: {exc}")
+
+
+# ═════════════════════════ TAB 6 — COMPARE MODULES ════════════════════════════
+with tab6:
+    st.subheader("⚖️ Module Comparison Dashboard")
+    st.caption(
+        "Run Liquidity Sweep and Break & Retest on the same dataset and compare results side by side. "
+        "Both runs are saved to Research History."
+    )
+
+    # ── Dataset selection ─────────────────────────────────────────────────────
+    st.markdown("### 1. Select Dataset")
+    cmp_datasets = _fetch_datasets()
+    if not cmp_datasets:
+        st.warning("No datasets stored. Upload a dataset first in **Run Analysis**.")
+        st.stop()
+
+    cmp_tf_mode = st.radio(
+        "Timeframe Mode",
+        ["Single Timeframe", "Multi-Timeframe"],
+        horizontal=True,
+        key="cmp_tf_mode",
+    )
+
+    cmp_ds_by_id = {d["dataset_id"]: d for d in cmp_datasets}
+    cmp_labels   = {d["dataset_id"]: _dataset_label(d) for d in cmp_datasets}
+    cmp_ids      = [d["dataset_id"] for d in cmp_datasets]
+
+    cmp_dataset_id:  str | None       = None
+    cmp_dataset_ids: dict[str, str]   = {}
+    cmp_structure_tf: str | None      = None
+    cmp_trend_tf:    str | None       = None
+    cmp_entry_tf:    str | None       = None
+    cmp_primary_tf   = "H1"
+
+    if cmp_tf_mode == "Single Timeframe":
+        cmp_chosen_id = st.selectbox(
+            "Dataset", cmp_ids, format_func=lambda x: cmp_labels.get(x, x), key="cmp_ds_sel"
+        )
+        cmp_dataset_id = cmp_chosen_id
+        cmp_primary_tf = cmp_ds_by_id[cmp_chosen_id]["timeframe"]
+    else:
+        cm1, cm2, cm3 = st.columns(3)
+        with cm1:
+            st.markdown("**Trend TF** *(optional)*")
+            cmp_tr = st.selectbox("Trend", ["None"] + cmp_ids,
+                                  format_func=lambda x: "None" if x == "None" else cmp_labels.get(x, x),
+                                  key="cmp_trend", label_visibility="collapsed")
+        with cm2:
+            st.markdown("**Structure TF** *(required)*")
+            cmp_st = st.selectbox("Structure", cmp_ids,
+                                  format_func=lambda x: cmp_labels.get(x, x),
+                                  key="cmp_struct", label_visibility="collapsed")
+        with cm3:
+            st.markdown("**Entry TF** *(optional)*")
+            cmp_en = st.selectbox("Entry", ["None"] + cmp_ids,
+                                  format_func=lambda x: "None" if x == "None" else cmp_labels.get(x, x),
+                                  key="cmp_entry", label_visibility="collapsed")
+        cmp_structure_tf = cmp_ds_by_id[cmp_st]["timeframe"]
+        cmp_primary_tf   = cmp_structure_tf
+        cmp_dataset_ids[cmp_structure_tf] = cmp_st
+        if cmp_tr and cmp_tr != "None":
+            cmp_trend_tf = cmp_ds_by_id[cmp_tr]["timeframe"]
+            cmp_dataset_ids[cmp_trend_tf] = cmp_tr
+        if cmp_en and cmp_en != "None":
+            cmp_entry_tf = cmp_ds_by_id[cmp_en]["timeframe"]
+            cmp_dataset_ids[cmp_entry_tf] = cmp_en
+
+    # ── Date range ────────────────────────────────────────────────────────────
+    st.markdown("### 2. Date Range")
+    cmp_all_fresh = _fetch_datasets()
+    cmp_info_map  = {d["dataset_id"]: d for d in cmp_all_fresh}
+
+    cmp_avail_starts: list = []
+    cmp_avail_ends:   list = []
+
+    cmp_source_ids = [cmp_dataset_id] if cmp_dataset_id else list(cmp_dataset_ids.values())
+    for _did in cmp_source_ids:
+        _d = cmp_info_map.get(_did, {})
+        _s = _parse_date(_d.get("start_datetime", ""))
+        _e = _parse_date(_d.get("end_datetime", ""))
+        if _s:
+            cmp_avail_starts.append(_s)
+        if _e:
+            cmp_avail_ends.append(_e)
+
+    cmp_bt_start: str | None = None
+    cmp_bt_end:   str | None = None
+
+    if cmp_avail_starts and cmp_avail_ends:
+        cmp_avail_start = max(cmp_avail_starts)
+        cmp_avail_end   = min(cmp_avail_ends)
+        ca1, ca2 = st.columns(2)
+        ca1.info(f"**Available Start:** {cmp_avail_start}")
+        ca2.info(f"**Available End:** {cmp_avail_end}")
+
+        cmp_use_full = st.checkbox("Use Full Dataset Range", value=True, key="cmp_full_range")
+        if cmp_use_full:
+            cmp_bt_start = str(cmp_avail_start)
+            cmp_bt_end   = str(cmp_avail_end)
+        else:
+            cd1, cd2 = st.columns(2)
+            with cd1:
+                cmp_start_val = st.date_input("Start Date", value=cmp_avail_start,
+                                              min_value=cmp_avail_start, max_value=cmp_avail_end,
+                                              key="cmp_start_inp")
+            with cd2:
+                cmp_end_val = st.date_input("End Date", value=cmp_avail_end,
+                                            min_value=cmp_avail_start, max_value=cmp_avail_end,
+                                            key="cmp_end_inp")
+            if cmp_start_val >= cmp_end_val:
+                st.error("❌ Start must be before End.")
+                st.stop()
+            cmp_bt_start = str(cmp_start_val)
+            cmp_bt_end   = str(cmp_end_val)
+
+    # ── Parameters ────────────────────────────────────────────────────────────
+    st.markdown("### 3. Shared Parameters")
+    cp1, cp2, cp3 = st.columns(3)
+    cmp_risk_pct = cp1.number_input("Risk % / Trade", min_value=0.25, max_value=3.0,
+                                    value=1.0, step=0.25, key="cmp_risk")
+    cmp_rr       = cp2.number_input("RR Ratio", min_value=1.0, max_value=5.0,
+                                    value=2.0, step=0.5, key="cmp_rr")
+    cmp_lookback = cp3.number_input("Swing N", min_value=2, max_value=20,
+                                    value=5, step=1, key="cmp_lookback")
+
+    st.markdown("**Break & Retest Params** *(used only for that module)*")
+    cbp1, cbp2 = st.columns(2)
+    cmp_breakout_buf  = cbp1.number_input("Breakout Buffer", min_value=0.0, max_value=2.0,
+                                          value=0.10, step=0.05, key="cmp_bb")
+    cmp_retest_tol    = cbp2.number_input("Retest Tolerance", min_value=0.0, max_value=2.0,
+                                          value=0.50, step=0.05, key="cmp_rt")
+
+    cmp_name = st.text_input("Comparison Name (optional)",
+                              placeholder="e.g. XAUUSD H1 — Q1 2024 Comparison",
+                              key="cmp_name_input")
+
+    cmp_modules_sel = st.multiselect(
+        "Modules to compare",
+        options=["liquidity_sweep", "break_retest"],
+        default=["liquidity_sweep", "break_retest"],
+        format_func=lambda x: {"liquidity_sweep": "Liquidity Sweep",
+                                "break_retest": "Break & Retest"}.get(x, x),
+        key="cmp_modules_sel",
+    )
+
+    # ── Run comparison ────────────────────────────────────────────────────────
+    st.markdown("### 4. Run Comparison")
+    run_cmp_btn = st.button("⚖️ Run Comparison", type="primary", key="run_cmp_btn",
+                            disabled=not cmp_modules_sel)
+
+    if run_cmp_btn:
+        cmp_payload: dict = {
+            "modules":          cmp_modules_sel,
+            "comparison_name":  cmp_name or "Module Comparison",
+            "analysis_mode":    "single" if cmp_tf_mode == "Single Timeframe" else "multi",
+            "timeframe":        cmp_primary_tf,
+            "risk_pct":         cmp_risk_pct,
+            "rr":               cmp_rr,
+            "lookback":         int(cmp_lookback),
+            "breakout_buffer":  cmp_breakout_buf,
+            "retest_tolerance": cmp_retest_tol,
+            "backtest_start":   cmp_bt_start,
+            "backtest_end":     cmp_bt_end,
+            "analysis_sub_mode": "full_backtest",
+        }
+        if cmp_tf_mode == "Single Timeframe":
+            cmp_payload["dataset_id"] = cmp_dataset_id
+        else:
+            cmp_payload["dataset_ids"]  = cmp_dataset_ids
+            cmp_payload["structure_tf"] = cmp_structure_tf
+            cmp_payload["trend_tf"]     = cmp_trend_tf
+            cmp_payload["entry_tf"]     = cmp_entry_tf
+
+        with st.spinner("Running comparison — both modules on the same dataset…"):
+            try:
+                cmp_resp = requests.post(f"{API}/api/v1/compare", json=cmp_payload, timeout=180)
+            except requests.exceptions.ConnectionError:
+                st.error("Lost connection to backend.")
+                st.stop()
+
+        if cmp_resp.status_code == 200:
+            st.session_state["cmp_result"] = cmp_resp.json()
+            st.success("Comparison complete!")
+        else:
+            try:
+                detail = cmp_resp.json().get("detail", cmp_resp.text)
+            except Exception:
+                detail = cmp_resp.text
+            st.error(f"Comparison failed ({cmp_resp.status_code}): {detail}")
+
+    # ── Display results ───────────────────────────────────────────────────────
+    _MOD_LABEL = {"liquidity_sweep": "Liquidity Sweep", "break_retest": "Break & Retest"}
+
+    if "cmp_result" in st.session_state:
+        cmp_data = st.session_state["cmp_result"]
+        st.divider()
+        st.markdown("### 📊 Comparison Table")
+
+        cmp_table = cmp_data.get("comparison", [])
+        if cmp_table:
+            # Highlight goal statuses with colour
+            cmp_df = pd.DataFrame(cmp_table)
+            st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+
+            # Winner call-out
+            valid = [r for r in cmp_table if "Error" not in r]
+            if len(valid) >= 2:
+                best_pf  = max(valid, key=lambda r: r.get("Profit Factor", 0))
+                best_mr  = max(valid, key=lambda r: r.get("Monthly Return %", 0))
+                best_dd  = min(valid, key=lambda r: r.get("Max Drawdown %", 999))
+                st.markdown(
+                    f"**Best Profit Factor:** {best_pf['Module']} `{best_pf.get('Profit Factor', 0):.2f}`  |  "
+                    f"**Best Monthly Return:** {best_mr['Module']} `{best_mr.get('Monthly Return %', 0):.2f}%`  |  "
+                    f"**Lowest Drawdown:** {best_dd['Module']} `{best_dd.get('Max Drawdown %', 0):.2f}%`"
+                )
+
+        # Export download
+        cmp_export = cmp_data.get("export_path", "")
+        if cmp_export:
+            st.caption(f"Saved: `{cmp_export}`")
+
+        if cmp_table:
+            cmp_csv = pd.DataFrame(cmp_table).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Comparison CSV",
+                data=cmp_csv,
+                file_name="module_comparison.csv",
+                mime="text/csv",
+                key="dl_cmp_csv",
+            )
+
+        # Any module errors
+        for mod_id, err in cmp_data.get("errors", {}).items():
+            st.error(f"❌ {_MOD_LABEL.get(mod_id, mod_id)}: {err}")
+
+        # Per-module detail
+        st.divider()
+        st.markdown("### 🔍 Per-Module Results")
+        for mod_id, mod_result in cmp_data.get("results", {}).items():
+            with st.expander(f"📈 {_MOD_LABEL.get(mod_id, mod_id)} — full results", expanded=False):
+                _render_results(mod_result, cmp_risk_pct, label=_MOD_LABEL.get(mod_id, mod_id))

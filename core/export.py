@@ -158,6 +158,32 @@ def build_report_json(result: dict) -> bytes:
     return json.dumps(result, indent=2, default=str).encode("utf-8")
 
 
+def save_module_comparison(rows: list[dict], run_datetime: str = "") -> Path:
+    """
+    Append module comparison rows to data/exports/module_comparison.csv.
+    Each call appends one block (one row per module) with a run timestamp.
+    Returns the absolute path of the file.
+    """
+    _ensure_dir()
+    path = _EXPORT_DIR / "module_comparison.csv"
+
+    if not rows:
+        return path.resolve()
+
+    # Inject run_datetime into each row for traceability
+    stamped = [{**r, "run_datetime": run_datetime} for r in rows]
+    fields  = list(stamped[0].keys())
+
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerows(stamped)
+
+    return path.resolve()
+
+
 def save_per_research_exports(research_id: str, result: dict) -> dict[str, Path]:
     """
     Write all per-research exports to data/exports/.

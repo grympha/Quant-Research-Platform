@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field
 
 from core import data_loader, export
 from core import report as report_gen
-from core.modules import liquidity_sweep
+from core.modules import break_retest, liquidity_sweep
 from database import db
 from database.db import (
     dataset_exists,
@@ -90,7 +90,19 @@ MODULES: list[dict] = [
             "Entry at next candle open, SL beyond wick, TP at RR target."
         ),
     },
+    {
+        "id":          "break_retest",
+        "name":        "Break & Retest",
+        "phase":       2,
+        "description": (
+            "Detects a confirmed swing level broken by a close, waits for price "
+            "to retest the broken level with a confirmation candle, then enters "
+            "on the next open. SL beyond the retest wick, TP at RR target."
+        ),
+    },
 ]
+
+_MODULE_DISPLAY: dict[str, str] = {m["id"]: m["name"] for m in MODULES}
 
 
 # ── App lifespan ──────────────────────────────────────────────────────────────
@@ -121,15 +133,15 @@ app.add_middleware(
 # ── Request schemas ───────────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    # ── New: stored dataset sources ────────────────────────────────────────────
-    dataset_id:  Optional[str]            = None   # single TF, stored
-    dataset_ids: Optional[dict[str, str]] = None   # multi TF, stored  {tf: dataset_id}
+    # ── Stored dataset sources ─────────────────────────────────────────────────
+    dataset_id:  Optional[str]            = None
+    dataset_ids: Optional[dict[str, str]] = None
 
-    # ── Legacy: file-based sources (backward compat) ───────────────────────────
-    upload_id:         Optional[str]            = None   # single TF, old upload
-    timeframe_uploads: Optional[dict[str, str]] = None   # multi TF, old uploads
+    # ── Legacy file-based sources (backward compat) ────────────────────────────
+    upload_id:         Optional[str]            = None
+    timeframe_uploads: Optional[dict[str, str]] = None
 
-    # ── Mode + role selectors ─────────────────────────────────────────────────
+    # ── Mode + TF role selectors ───────────────────────────────────────────────
     analysis_mode: str           = "single"
     trend_tf:      Optional[str] = None
     structure_tf:  Optional[str] = None
@@ -144,10 +156,20 @@ class AnalyzeRequest(BaseModel):
     max_bars:      int   = Field(default=200,  ge=10,  le=500)
     research_name: Optional[str] = None
 
+    # ── Break & Retest specific ────────────────────────────────────────────────
+    breakout_buffer:   float = Field(default=0.10, ge=0.0, le=5.0)
+    retest_tolerance:  float = Field(default=0.50, ge=0.0, le=5.0)
+
     # ── Date range + analysis sub-mode ────────────────────────────────────────
-    backtest_start:    Optional[str] = None   # "YYYY-MM-DD"
-    backtest_end:      Optional[str] = None   # "YYYY-MM-DD"
+    backtest_start:    Optional[str] = None
+    backtest_end:      Optional[str] = None
     analysis_sub_mode: str           = "full_backtest"
+
+
+class CompareRequest(AnalyzeRequest):
+    """Run multiple modules on the same dataset and compare results."""
+    modules:          list[str]      = ["liquidity_sweep", "break_retest"]
+    comparison_name:  Optional[str]  = None
 
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -366,32 +388,22 @@ def _sanitise_report(rpt: dict) -> dict:
     return out
 
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
+# ── Analysis helpers ──────────────────────────────────────────────────────────
 
-@app.post("/api/v1/analyze", tags=["Analysis"])
-def analyze(req: AnalyzeRequest):
+def _resolve_data(req: AnalyzeRequest) -> tuple[dict, str, dict, str]:
     """
-    Run a strategy module.
-
-    Data source priority (first match wins):
-      1. dataset_id  / dataset_ids   — load from SQLite ohlcv_candles
-      2. upload_id   / timeframe_uploads — load from uploaded file (legacy)
+    Resolve data source from request.  Returns:
+      (data_by_timeframe, primary_tf, dataset_ids_used, export_filename)
+    Raises HTTPException on any error.
     """
-    print("[analyze] ──────────────────────────────────────────────", flush=True)
-    print(f"[analyze] module={req.module}  mode={req.analysis_mode}  sub_mode={req.analysis_sub_mode}", flush=True)
-    print(f"[analyze] dataset_id={req.dataset_id}  dataset_ids={req.dataset_ids}", flush=True)
-    print(f"[analyze] backtest_start={req.backtest_start}  backtest_end={req.backtest_end}", flush=True)
-
-    data_by_timeframe: dict = {}
-    primary_tf        = req.timeframe
+    data_by_timeframe: dict          = {}
+    primary_tf                       = req.timeframe
     dataset_ids_used: dict[str, str] = {}
-    export_filename   = "unknown"
+    export_filename                  = "unknown"
 
-    # ── Resolve data source ────────────────────────────────────────────────────
     use_stored = bool(req.dataset_id or req.dataset_ids)
 
     if use_stored:
-        # ── Stored dataset(s) ──────────────────────────────────────────────────
         if req.analysis_mode == "multi":
             src = req.dataset_ids or {}
             if not src:
@@ -405,7 +417,6 @@ def analyze(req: AnalyzeRequest):
                 except Exception as exc:
                     raise HTTPException(500, f"Failed to load dataset '{tf}': {exc}")
                 dataset_ids_used[tf] = did
-
             primary_tf = req.structure_tf or next(iter(data_by_timeframe))
             if primary_tf not in data_by_timeframe:
                 raise HTTPException(
@@ -414,8 +425,7 @@ def analyze(req: AnalyzeRequest):
                     f"(available: {list(data_by_timeframe.keys())}).",
                 )
             export_filename = "multi_tf_" + "_".join(sorted(src.keys()))
-
-        else:  # single stored
+        else:
             if not req.dataset_id:
                 raise HTTPException(400, "dataset_id required for single-TF mode.")
             meta = get_dataset_by_id(req.dataset_id)
@@ -429,9 +439,7 @@ def analyze(req: AnalyzeRequest):
             primary_tf = req.timeframe
             dataset_ids_used[req.timeframe] = req.dataset_id
             export_filename = meta["filename"]
-
     else:
-        # ── Legacy file-based source ───────────────────────────────────────────
         if req.analysis_mode == "multi":
             src = req.timeframe_uploads or {}
             if not src:
@@ -448,8 +456,7 @@ def analyze(req: AnalyzeRequest):
             if primary_tf not in data_by_timeframe:
                 raise HTTPException(400, f"Structure TF '{primary_tf}' not in uploads.")
             export_filename = "multi_tf_" + "_".join(sorted(src.keys()))
-
-        else:  # single legacy
+        else:
             if not req.upload_id:
                 raise HTTPException(400, "upload_id required for single-TF mode.")
             upload = get_upload_by_id(req.upload_id)
@@ -460,12 +467,91 @@ def analyze(req: AnalyzeRequest):
             except Exception as exc:
                 raise HTTPException(500, f"Failed to reload data: {exc}")
             data_by_timeframe[req.timeframe] = df
-            primary_tf    = req.timeframe
+            primary_tf      = req.timeframe
             export_filename = upload["filename"]
 
-    primary_df = data_by_timeframe[primary_tf]
+    return data_by_timeframe, primary_tf, dataset_ids_used, export_filename
 
-    # ── Validate stored dataset IDs still exist in DB ─────────────────────────
+
+def _apply_date_filter(
+    data_by_timeframe: dict,
+    primary_tf: str,
+    backtest_start: str | None,
+    backtest_end:   str | None,
+) -> tuple[dict, object]:
+    """Slice each TF DataFrame to the requested date range."""
+    if not (backtest_start or backtest_end):
+        return data_by_timeframe, data_by_timeframe[primary_tf]
+
+    for _tf_key in list(data_by_timeframe.keys()):
+        _df = data_by_timeframe[_tf_key]
+        try:
+            if backtest_start:
+                _df = _df[_df.index >= pd.Timestamp(backtest_start)]
+            if backtest_end:
+                _df = _df[_df.index < pd.Timestamp(backtest_end) + pd.Timedelta(days=1)]
+        except Exception as exc:
+            raise HTTPException(400, f"Invalid date range: {exc}")
+        if _df.empty:
+            raise HTTPException(
+                400,
+                f"No data for '{_tf_key}' in range "
+                f"{backtest_start or 'start'} → {backtest_end or 'end'}.",
+            )
+        data_by_timeframe[_tf_key] = _df
+
+    return data_by_timeframe, data_by_timeframe[primary_tf]
+
+
+def _dispatch_module(
+    module: str,
+    primary_df,
+    req: AnalyzeRequest,
+    data_by_timeframe: dict,
+) -> list[dict]:
+    """Run the specified strategy module and return raw trade dicts."""
+    multi_data = data_by_timeframe if req.analysis_mode == "multi" else None
+
+    if module == "liquidity_sweep":
+        return liquidity_sweep.run(
+            primary_df,
+            rr=req.rr,
+            lookback=req.lookback,
+            max_bars=req.max_bars,
+            data_by_timeframe=multi_data,
+            trend_tf=req.trend_tf,
+            structure_tf=req.structure_tf,
+            entry_tf=req.entry_tf,
+        )
+
+    if module == "break_retest":
+        return break_retest.run(
+            primary_df,
+            rr=req.rr,
+            lookback=req.lookback,
+            max_bars=req.max_bars,
+            breakout_buffer=req.breakout_buffer,
+            retest_tolerance=req.retest_tolerance,
+            data_by_timeframe=multi_data,
+            trend_tf=req.trend_tf,
+            structure_tf=req.structure_tf,
+            entry_tf=req.entry_tf,
+        )
+
+    raise HTTPException(400, f"Unknown module: {module!r}")
+
+
+def _run_analysis(req: AnalyzeRequest) -> dict:
+    """
+    Core pipeline shared by /analyze and /compare.
+    Resolves data, applies date filter, dispatches module, saves to DB.
+    Returns the full result payload dict.
+    """
+    print(f"[analyze] module={req.module}  mode={req.analysis_mode}  sub={req.analysis_sub_mode}", flush=True)
+
+    data_by_timeframe, primary_tf, dataset_ids_used, export_filename = _resolve_data(req)
+
+    # Validate dataset IDs still exist
     print(f"[analyze] dataset_ids_used={dataset_ids_used}", flush=True)
     for _tf, _did in dataset_ids_used.items():
         if not dataset_exists(_did):
@@ -475,126 +561,168 @@ def analyze(req: AnalyzeRequest):
                 f"(TF={_tf}, dataset_id={_did})",
             )
 
-    # ── Apply backtest date range filter ──────────────────────────────────────
-    if req.backtest_start or req.backtest_end:
-        for _tf_key in list(data_by_timeframe.keys()):
-            _df = data_by_timeframe[_tf_key]
-            try:
-                if req.backtest_start:
-                    _df = _df[_df.index >= pd.Timestamp(req.backtest_start)]
-                if req.backtest_end:
-                    _df = _df[_df.index < pd.Timestamp(req.backtest_end) + pd.Timedelta(days=1)]
-            except Exception as exc:
-                raise HTTPException(400, f"Invalid date range: {exc}")
-            if _df.empty:
-                raise HTTPException(
-                    400,
-                    f"No data for '{_tf_key}' in range "
-                    f"{req.backtest_start or 'start'} → {req.backtest_end or 'end'}.",
-                )
-            data_by_timeframe[_tf_key] = _df
-        primary_df = data_by_timeframe[primary_tf]
+    data_by_timeframe, primary_df = _apply_date_filter(
+        data_by_timeframe, primary_tf, req.backtest_start, req.backtest_end
+    )
 
+    trades = _dispatch_module(req.module, primary_df, req, data_by_timeframe)
+
+    rpt = _sanitise_report(report_gen.generate(
+        trades,
+        req.risk_pct,
+        start_date=str(primary_df.index[0]),
+        end_date=str(primary_df.index[-1]),
+    ))
+
+    clean_trades = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
+
+    research_id = save_research_run_complete(
+        research_name     = req.research_name,
+        selected_module   = req.module,
+        symbol            = "XAUUSD",
+        timeframe_mode    = req.analysis_mode,
+        timeframes_used   = list(data_by_timeframe.keys()),
+        dataset_ids_used  = dataset_ids_used,
+        risk_percent      = req.risk_pct,
+        reward_risk_ratio = req.rr,
+        lookback          = req.lookback,
+        report            = rpt,
+        trades            = clean_trades,
+        monthly_breakdown = rpt.get("monthly_breakdown", []),
+        backtest_start    = req.backtest_start,
+        backtest_end      = req.backtest_end,
+        analysis_sub_mode = req.analysis_sub_mode,
+    )
+    print(f"[analyze] research_id={research_id}  trades={len(clean_trades)}", flush=True)
+
+    legacy_uid = (
+        req.upload_id
+        or (next(iter(req.timeframe_uploads.values())) if req.timeframe_uploads else None)
+        or research_id
+    )
+    legacy_aid = save_analysis(legacy_uid, req.module, primary_tf, req.risk_pct, req.rr, rpt)
+
+    trade_log_path = str(export.save_trade_log(clean_trades, run_id=research_id))
+    summary_path   = str(export.save_research_summary(
+        report=rpt, run_id=research_id, filename=export_filename,
+        timeframe=primary_tf, module=req.module,
+        risk_pct=req.risk_pct, rr=req.rr, lookback=req.lookback,
+    ))
+
+    result_payload = {
+        "research_id":       research_id,
+        "analysis_id":       legacy_aid,
+        "symbol":            "XAUUSD",
+        "module":            req.module,
+        "analysis_mode":     req.analysis_mode,
+        "analysis_sub_mode": req.analysis_sub_mode,
+        "backtest_start":    req.backtest_start,
+        "backtest_end":      req.backtest_end,
+        "timeframe":         primary_tf,
+        "timeframes_used":   list(data_by_timeframe.keys()),
+        "structure_tf":      req.structure_tf,
+        "entry_tf":          req.entry_tf,
+        "trend_tf":          req.trend_tf,
+        "parameters":        {
+            "risk_pct": req.risk_pct,
+            "rr":       req.rr,
+            "lookback": req.lookback,
+            "breakout_buffer":  req.breakout_buffer,
+            "retest_tolerance": req.retest_tolerance,
+        },
+        "trades":            clean_trades,
+        "report":            rpt,
+        "exports":           {"trade_log": trade_log_path, "research_summary": summary_path},
+    }
+
+    per_run_paths = export.save_per_research_exports(research_id, result_payload)
+    result_payload["exports"].update({k: str(v) for k, v in per_run_paths.items()})
+
+    return result_payload
+
+
+# ── Analysis endpoints ────────────────────────────────────────────────────────
+
+@app.post("/api/v1/analyze", tags=["Analysis"])
+def analyze(req: AnalyzeRequest):
+    """Run a single strategy module and return the full result payload."""
     try:
-        # ── Run strategy ───────────────────────────────────────────────────────
-        if req.module == "liquidity_sweep":
-            trades = liquidity_sweep.run(
-                primary_df,
-                rr=req.rr,
-                lookback=req.lookback,
-                max_bars=req.max_bars,
-                data_by_timeframe=data_by_timeframe if req.analysis_mode == "multi" else None,
-                trend_tf=req.trend_tf,
-                structure_tf=req.structure_tf,
-                entry_tf=req.entry_tf,
-            )
-        else:
-            raise HTTPException(400, f"Unknown module: {req.module!r}")
-
-        # ── Generate report ────────────────────────────────────────────────────
-        rpt = report_gen.generate(
-            trades,
-            req.risk_pct,
-            start_date=str(primary_df.index[0]),
-            end_date=str(primary_df.index[-1]),
-        )
-
-        # Sanitise: replace any non-finite floats before JSON serialisation
-        rpt = _sanitise_report(rpt)
-
-        # ── Persist research run + trades + monthly in one atomic transaction ──
-        clean_trades = [
-            {k: v for k, v in t.items() if not k.startswith("_")}
-            for t in trades
-        ]
-
-        research_id = save_research_run_complete(
-            research_name=req.research_name,
-            selected_module=req.module,
-            symbol="XAUUSD",
-            timeframe_mode=req.analysis_mode,
-            timeframes_used=list(data_by_timeframe.keys()),
-            dataset_ids_used=dataset_ids_used,
-            risk_percent=req.risk_pct,
-            reward_risk_ratio=req.rr,
-            lookback=req.lookback,
-            report=rpt,
-            trades=clean_trades,
-            monthly_breakdown=rpt.get("monthly_breakdown", []),
-            backtest_start=req.backtest_start,
-            backtest_end=req.backtest_end,
-            analysis_sub_mode=req.analysis_sub_mode,
-        )
-
-        print(f"[analyze] research_id={research_id}  trades={len(clean_trades)}  monthly={len(rpt.get('monthly_breakdown', []))}", flush=True)
-
-        # ── Legacy analysis record (backward compat with /api/v1/history) ─────
-        legacy_uid = (
-            req.upload_id
-            or (next(iter(req.timeframe_uploads.values())) if req.timeframe_uploads else None)
-            or research_id
-        )
-        legacy_aid = save_analysis(legacy_uid, req.module, primary_tf, req.risk_pct, req.rr, rpt)
-
-        # ── Append-mode CSV exports ────────────────────────────────────────────
-        trade_log_path = str(export.save_trade_log(clean_trades, run_id=research_id))
-        summary_path   = str(export.save_research_summary(
-            report=rpt, run_id=research_id, filename=export_filename,
-            timeframe=primary_tf, module=req.module,
-            risk_pct=req.risk_pct, rr=req.rr, lookback=req.lookback,
-        ))
-
-        # ── Per-research file exports ──────────────────────────────────────────
-        result_payload = {
-            "research_id":      research_id,
-            "analysis_id":      legacy_aid,
-            "symbol":           "XAUUSD",
-            "module":           req.module,
-            "analysis_mode":    req.analysis_mode,
-            "analysis_sub_mode": req.analysis_sub_mode,
-            "backtest_start":   req.backtest_start,
-            "backtest_end":     req.backtest_end,
-            "timeframe":        primary_tf,
-            "timeframes_used":  list(data_by_timeframe.keys()),
-            "structure_tf":     req.structure_tf,
-            "entry_tf":         req.entry_tf,
-            "trend_tf":         req.trend_tf,
-            "parameters":       {"risk_pct": req.risk_pct, "rr": req.rr, "lookback": req.lookback},
-            "trades":           clean_trades,
-            "report":           rpt,
-            "exports":          {"trade_log": trade_log_path, "research_summary": summary_path},
-        }
-        per_run_paths = export.save_per_research_exports(research_id, result_payload)
-        result_payload["exports"].update({k: str(v) for k, v in per_run_paths.items()})
-
-        return result_payload
-
+        return _run_analysis(req)
     except HTTPException:
-        raise  # re-raise expected HTTP errors as-is
+        raise
     except Exception as exc:
         tb = traceback.format_exc()
         print(f"[analyze] UNHANDLED ERROR:\n{tb}", flush=True)
         raise HTTPException(500, detail=f"{type(exc).__name__}: {exc}")
+
+
+@app.post("/api/v1/compare", tags=["Analysis"])
+def compare(req: CompareRequest):
+    """
+    Run multiple strategy modules on the same dataset and compare results.
+    Both runs are saved to research_runs just like /analyze.
+    Returns a comparison table + per-module full results.
+    Saves data/exports/module_comparison.csv.
+    """
+    from datetime import datetime, timezone
+
+    if not req.modules:
+        raise HTTPException(400, "Provide at least one module in 'modules'.")
+
+    unknown = [m for m in req.modules if m not in _MODULE_DISPLAY]
+    if unknown:
+        raise HTTPException(400, f"Unknown module(s): {unknown}. Valid: {list(_MODULE_DISPLAY)}")
+
+    results: dict[str, dict] = {}
+    errors:  dict[str, str]  = {}
+
+    for mod in req.modules:
+        mod_req = req.model_copy(update={"module": mod, "research_name": (
+            f"{req.comparison_name or 'Comparison'} [{_MODULE_DISPLAY[mod]}]"
+        )})
+        try:
+            results[mod] = _run_analysis(mod_req)
+        except HTTPException as exc:
+            errors[mod] = str(exc.detail)
+        except Exception as exc:
+            errors[mod] = f"{type(exc).__name__}: {exc}"
+            print(f"[compare] module={mod} ERROR: {exc}", flush=True)
+
+    comparison = []
+    for mod in req.modules:
+        if mod in results:
+            rpt = results[mod].get("report", {})
+            comparison.append({
+                "Module":          _MODULE_DISPLAY.get(mod, mod),
+                "Module ID":       mod,
+                "Total Trades":    rpt.get("total_trades", 0),
+                "Wins":            rpt.get("win_trades", 0),
+                "Losses":          rpt.get("loss_trades", 0),
+                "Win Rate %":      rpt.get("win_rate", 0.0),
+                "Profit Factor":   rpt.get("profit_factor", 0.0),
+                "Net R":           rpt.get("net_r", 0.0),
+                "Monthly Return %":rpt.get("monthly_return", 0.0),
+                "Max Drawdown %":  rpt.get("max_drawdown", 0.0),
+                "Goal Status":     rpt.get("goal_status", "—"),
+                "Research ID":     results[mod].get("research_id", ""),
+            })
+        else:
+            comparison.append({
+                "Module":    _MODULE_DISPLAY.get(mod, mod),
+                "Module ID": mod,
+                "Error":     errors.get(mod, "unknown error"),
+            })
+
+    run_dt  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cmp_path = str(export.save_module_comparison(comparison, run_datetime=run_dt))
+
+    return {
+        "comparison":   comparison,
+        "results":      results,
+        "errors":       errors,
+        "export_path":  cmp_path,
+        "run_datetime": run_dt,
+    }
 
 
 # ── Research History ──────────────────────────────────────────────────────────
