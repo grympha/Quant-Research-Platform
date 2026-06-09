@@ -293,7 +293,7 @@ neg_col = "#ef5350"
 
 # ── Results renderer (shared across Tab 1, Tab 3) ─────────────────────────────
 
-def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
+def _render_results(result: dict, risk_pct_val: float, label: str = "", chart_key_prefix: str = "main") -> None:
     fast_mode = st.session_state.get("perf_mode", False)
     rpt      = result.get("report", {})
     trades   = result.get("trades", [])
@@ -392,7 +392,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                 template="plotly_dark", height=350,
                 margin=dict(l=10, r=10, t=45, b=10), showlegend=False,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"{chart_key_prefix}_equity")
 
             cd, ct = st.columns([1, 2])
             with cd:
@@ -404,7 +404,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                 ))
                 fig_p.update_layout(template="plotly_dark", height=240,
                                     margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
-                st.plotly_chart(fig_p, use_container_width=True)
+                st.plotly_chart(fig_p, use_container_width=True, key=f"{chart_key_prefix}_pie")
             with ct:
                 st.dataframe(pd.DataFrame([
                     ("Gross Profit R", f"+{rpt.get('gross_profit_r', 0):.2f}R"),
@@ -458,7 +458,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                     margin=dict(l=10, r=10, t=45, b=10),
                     showlegend=False,
                 )
-                st.plotly_chart(fig_dd, use_container_width=True)
+                st.plotly_chart(fig_dd, use_container_width=True, key=f"{chart_key_prefix}_dd")
             else:
                 st.info("Drawdown curve not available — run a new analysis to generate it.")
 
@@ -489,7 +489,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
             fig_mo.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
             fig_mo.update_layout(template="plotly_dark", height=350,
                                  margin=dict(l=10, r=10, t=45, b=10))
-            st.plotly_chart(fig_mo, use_container_width=True)
+            st.plotly_chart(fig_mo, use_container_width=True, key=f"{chart_key_prefix}_monthly")
 
             # Yearly breakdown (shown when sub_mode == "yearly")
             if sub_mode == "yearly":
@@ -554,7 +554,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                     template="plotly_dark", height=300,
                     margin=dict(l=10, r=10, t=45, b=10),
                 )
-                st.plotly_chart(fig_yr, use_container_width=True)
+                st.plotly_chart(fig_yr, use_container_width=True, key=f"{chart_key_prefix}_yearly")
                 st.divider()
 
             st.dataframe(pd.DataFrame(monthly).rename(columns={
@@ -1268,15 +1268,15 @@ with tab1:
 
         st.divider()
         st.markdown("### In-Sample Results")
-        _render_results(is_r, risk_pct)
+        _render_results(is_r, risk_pct, chart_key_prefix="wf_is")
         st.divider()
         st.markdown("### Out-of-Sample Results")
-        _render_results(oos_r, risk_pct)
+        _render_results(oos_r, risk_pct, chart_key_prefix="wf_oos")
 
     elif "analysis" in st.session_state:
         st.divider()
         st.subheader("Step 4 — Results")
-        _render_results(st.session_state["analysis"], risk_pct)
+        _render_results(st.session_state["analysis"], risk_pct, chart_key_prefix="main")
 
 
 # ═════════════════════════ TAB 2 — DATASET LIBRARY ════════════════════════════
@@ -1504,7 +1504,7 @@ with tab3:
                                 },
                                 "exports": {},
                             }
-                            _render_results(fake_result, run_detail["risk_percent"])
+                            _render_results(fake_result, run_detail["risk_percent"], chart_key_prefix=f"hist_{sel_rid[:8]}")
                         else:
                             st.info("Full report not available for this run.")
                 except Exception as exc:
@@ -1569,7 +1569,7 @@ with tab3:
                                             f"Re-run complete — "
                                             f"ID: {rerun_result.get('research_id','')[:8]}"
                                         )
-                                        _render_results(rerun_result, rd["risk_percent"])
+                                        _render_results(rerun_result, rd["risk_percent"], chart_key_prefix=f"rerun_{sel_rid[:8]}")
                                     except svc.SvcError as _e:
                                         st.error(f"Re-run failed: {_e.message}")
                 except Exception as exc:
@@ -2056,7 +2056,7 @@ with tab6:
         st.markdown("### 🔍 Per-Module Results")
         for mod_id, mod_result in cmp_data.get("results", {}).items():
             with st.expander(f"📈 {_MOD_LABEL.get(mod_id, mod_id)} — full results", expanded=False):
-                _render_results(mod_result, cmp_risk_pct, label=_MOD_LABEL.get(mod_id, mod_id))
+                _render_results(mod_result, cmp_risk_pct, label=_MOD_LABEL.get(mod_id, mod_id), chart_key_prefix=f"cmp_{mod_id}")
 
 
 # ═════════════════════════ TAB 7 — GOAL PROFILES ══════════════════════════════
