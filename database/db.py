@@ -755,3 +755,76 @@ def get_monthly_reports(research_id: str) -> list[dict]:
             (research_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Platform health & admin ───────────────────────────────────────────────────
+
+def get_db_health() -> dict:
+    """
+    Return DB stats for the Platform Health page.
+    Never raises — errors are captured in the 'connection' field.
+    """
+    result: dict = {
+        "db_path":         str(DB_PATH.resolve()),
+        "db_file_exists":  DB_PATH.exists(),
+        "db_file_size_kb": round(DB_PATH.stat().st_size / 1024, 1) if DB_PATH.exists() else 0,
+        "connection":      "error",
+        "foreign_keys_on": False,
+        "tables":          {},
+        "latest_research_run": None,
+    }
+    try:
+        with _connect() as conn:
+            fk_row = conn.execute("PRAGMA foreign_keys").fetchone()
+            result["foreign_keys_on"] = bool(fk_row and fk_row[0])
+
+            for tbl in ("datasets", "ohlcv_candles", "research_runs",
+                        "trade_logs", "monthly_reports"):
+                if _tbl_exists(conn, tbl):
+                    cnt = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    result["tables"][tbl] = cnt
+                else:
+                    result["tables"][tbl] = None   # table doesn't exist yet
+
+            row = conn.execute(
+                "SELECT research_id, research_name, created_datetime, goal_status "
+                "FROM research_runs ORDER BY created_datetime DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                result["latest_research_run"] = dict(row)
+
+            result["connection"] = "ok"
+    except Exception as exc:
+        result["connection"] = f"error: {exc}"
+    return result
+
+
+def reset_database() -> None:
+    """
+    Drop ALL tables and recreate the schema from scratch.
+    FOR DEVELOPMENT USE ONLY — all stored data will be permanently deleted.
+    """
+    print("[db] reset_database() — dropping all tables …", flush=True)
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+        for tbl in [
+            "monthly_reports", "trade_logs", "research_runs",
+            "ohlcv_candles", "datasets",
+            "analyses", "uploads",
+        ]:
+            conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        conn.execute("COMMIT")
+        print("[db] reset_database() — all tables dropped.", flush=True)
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    init_db()
+    print("[db] reset_database() complete — fresh schema created.", flush=True)

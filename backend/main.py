@@ -58,6 +58,7 @@ from database.db import (
     get_dataset_by_hash,
     get_dataset_by_id,
     get_dataset_candles,
+    get_db_health,
     get_monthly_reports,
     get_recent_analyses,
     get_research_run,
@@ -66,6 +67,7 @@ from database.db import (
     init_db,
     list_datasets,
     list_research_runs,
+    reset_database,
     save_analysis,
     save_dataset_candles,
     save_dataset_metadata,
@@ -152,7 +154,32 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/health", tags=["System"])
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0"}
+
+
+@app.get("/api/v1/health/db", tags=["System"])
+def health_db():
+    """Return database health stats: connection, FK status, table row counts, latest run."""
+    return get_db_health()
+
+
+@app.post("/api/v1/admin/reset-db", tags=["Admin"])
+def admin_reset_db(confirm: str = ""):
+    """
+    Drop all tables and recreate schema from scratch.
+    FOR DEVELOPMENT USE ONLY.
+    Must pass ?confirm=RESET to execute.
+    """
+    if confirm != "RESET":
+        raise HTTPException(
+            400,
+            "Pass ?confirm=RESET to execute. WARNING: this deletes all stored data.",
+        )
+    try:
+        reset_database()
+    except Exception as exc:
+        raise HTTPException(500, f"Reset failed: {exc}")
+    return {"status": "reset_complete", "message": "All tables dropped and recreated."}
 
 
 @app.get("/api/v1/modules", tags=["Modules"])

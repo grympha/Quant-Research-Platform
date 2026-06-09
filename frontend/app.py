@@ -82,7 +82,7 @@ st.markdown("""
 col_t, col_s = st.columns([3, 1])
 with col_t:
     st.title("📊 XAUUSD Quant Research Platform")
-    st.caption("v3.1 — Date Range · Yearly / Monthly / Walk Forward · Drawdown Chart")
+    st.caption("v3.2 — Phase 1.5 Stability · Platform Health · Reset DB")
 with col_s:
     try:
         r = requests.get(f"{API}/health", timeout=2)
@@ -477,11 +477,12 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "▶ Run Analysis",
     "📂 Dataset Library",
     "🕒 Research History",
     "📤 Export Center",
+    "🏥 Platform Health",
 ])
 
 
@@ -1505,3 +1506,146 @@ with tab4:
         "Individual per-run files are also saved after each analysis:  \n"
         "`trade_log_{id}.csv`, `monthly_{id}.csv`, `summary_{id}.csv`, `report_{id}.json`"
     )
+
+
+# ═════════════════════════ TAB 5 — PLATFORM HEALTH ════════════════════════════
+with tab5:
+    st.subheader("🏥 Platform Health")
+    st.caption("Database integrity, storage stats, and development tools.")
+
+    if st.button("🔄 Refresh", key="health_refresh"):
+        st.rerun()
+
+    # ── DB Health from API ────────────────────────────────────────────────────
+    try:
+        h_resp = requests.get(f"{API}/api/v1/health/db", timeout=5)
+        h = h_resp.json() if h_resp.status_code == 200 else {}
+    except Exception:
+        h = {}
+        st.error("Cannot reach backend — is uvicorn running on port 8000?")
+
+    st.markdown("### 🗄️ Database")
+    db_ok = h.get("connection") == "ok"
+
+    hc1, hc2, hc3, hc4 = st.columns(4)
+    hc1.metric("Connection",    "✅ OK"  if db_ok  else "❌ Error")
+    hc2.metric("Foreign Keys",  "✅ ON"  if h.get("foreign_keys_on") else "❌ OFF")
+    hc3.metric("File Exists",   "✅ Yes" if h.get("db_file_exists")  else "❌ No")
+    hc4.metric("File Size",     f"{h.get('db_file_size_kb', 0)} KB")
+
+    if h.get("db_path"):
+        st.code(h["db_path"], language=None)
+
+    if not db_ok and h.get("connection"):
+        st.error(f"DB error: {h['connection']}")
+
+    # ── Table Row Counts ──────────────────────────────────────────────────────
+    st.markdown("### 📊 Table Counts")
+    tables = h.get("tables", {})
+    if tables:
+        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+        for col, tbl, label in [
+            (tc1, "datasets",       "Datasets"),
+            (tc2, "ohlcv_candles",  "Candles"),
+            (tc3, "research_runs",  "Research Runs"),
+            (tc4, "trade_logs",     "Trade Logs"),
+            (tc5, "monthly_reports","Monthly Reports"),
+        ]:
+            v = tables.get(tbl)
+            col.metric(label, f"{v:,}" if v is not None else "⚠️ Missing")
+    else:
+        st.info("No table data available.")
+
+    # ── Latest Research Run ───────────────────────────────────────────────────
+    st.markdown("### 🕒 Latest Research Run")
+    latest = h.get("latest_research_run")
+    if latest:
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        lc1.markdown(f"**ID:** `{latest.get('research_id','—')[:8]}…`")
+        lc2.markdown(f"**Name:** {latest.get('research_name','—')}")
+        lc3.markdown(f"**Created:** {str(latest.get('created_datetime','—'))[:16]}")
+        lc4.markdown(f"**Status:** {latest.get('goal_status','—')}")
+    else:
+        st.info("No research runs recorded yet.")
+
+    # ── Export Folder ─────────────────────────────────────────────────────────
+    st.markdown("### 📁 Export Folder")
+    export_dir = Path("data/exports")
+    if export_dir.exists():
+        export_files = sorted(export_dir.iterdir())
+        total_kb     = sum(f.stat().st_size for f in export_files if f.is_file()) / 1024
+        ec1, ec2, ec3 = st.columns(3)
+        ec1.metric("Status",     "✅ Exists")
+        ec2.metric("Files",      len([f for f in export_files if f.is_file()]))
+        ec3.metric("Total Size", f"{total_kb:.1f} KB")
+
+        if export_files:
+            with st.expander("📂 Show export files"):
+                for f in export_files:
+                    if f.is_file():
+                        sz = f.stat().st_size
+                        st.markdown(f"`{f.name}` — {sz:,} bytes")
+    else:
+        st.warning("Export folder `data/exports/` does not exist yet. Run an analysis to create it.")
+
+    # ── Validation Checklist ──────────────────────────────────────────────────
+    st.markdown("### ✅ Validation Checklist")
+    checks = [
+        ("Backend API reachable",        db_ok or h.get("connection") != {}),
+        ("Database file exists",         h.get("db_file_exists", False)),
+        ("Foreign keys ON",              h.get("foreign_keys_on", False)),
+        ("datasets table present",       tables.get("datasets") is not None),
+        ("ohlcv_candles table present",  tables.get("ohlcv_candles") is not None),
+        ("research_runs table present",  tables.get("research_runs") is not None),
+        ("trade_logs table present",     tables.get("trade_logs") is not None),
+        ("monthly_reports table present",tables.get("monthly_reports") is not None),
+        ("At least 1 dataset stored",    (tables.get("datasets") or 0) >= 1),
+        ("At least 1 research run saved",(tables.get("research_runs") or 0) >= 1),
+        ("Export folder exists",         export_dir.exists()),
+    ]
+    chk_df = pd.DataFrame([
+        {"Check": c, "Result": "✅ Pass" if ok else "❌ Fail"}
+        for c, ok in checks
+    ])
+    st.dataframe(chk_df, use_container_width=True, hide_index=True)
+
+    # ── Reset Database (Dev Only) ─────────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⚠️ Reset Database — Development Only")
+    st.warning(
+        "**Danger zone.** This permanently deletes ALL datasets, candles, "
+        "research runs, trade logs, and monthly reports. "
+        "The schema is recreated from scratch.  \n"
+        "Only use this during development to start fresh."
+    )
+
+    confirmed_cb = st.checkbox(
+        "I understand this will permanently delete ALL stored data.",
+        key="reset_confirm_cb",
+    )
+    reset_phrase = st.text_input(
+        "Type **RESET** to enable the button:",
+        key="reset_phrase_input",
+        disabled=not confirmed_cb,
+    )
+    reset_ok = confirmed_cb and reset_phrase.strip() == "RESET"
+
+    if st.button(
+        "🗑️ Reset Database",
+        type="primary",
+        disabled=not reset_ok,
+        key="reset_db_btn",
+    ):
+        try:
+            rr = requests.post(
+                f"{API}/api/v1/admin/reset-db?confirm=RESET", timeout=30
+            )
+            if rr.status_code == 200:
+                st.success("✅ Database reset complete. All tables recreated.")
+                for k in list(st.session_state.keys()):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            else:
+                st.error(f"Reset failed ({rr.status_code}): {rr.text}")
+        except Exception as exc:
+            st.error(f"Connection error: {exc}")

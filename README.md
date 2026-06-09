@@ -1,260 +1,207 @@
 # XAUUSD Quant Research Platform
 
-Phase 3 — Persistent Dataset Library, Research History, and Export Center.
+**Phase 1.5 — Stability & Validation**
+
+A persistent backtesting platform for the Liquidity Sweep strategy on XAUUSD.
+Stores OHLCV datasets and research history in SQLite so every run is reusable.
+
+---
 
 ## Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | Streamlit (4-tab dashboard) |
-| Backend API | FastAPI + Uvicorn |
-| Database | SQLite (`data/quant.db`) |
-| Data | Pandas + NumPy |
-| Charts | Plotly |
+| Layer    | Technology                        |
+|----------|-----------------------------------|
+| Backend  | FastAPI + Uvicorn (port 8000)     |
+| Frontend | Streamlit (port 8501)             |
+| Database | SQLite (WAL mode, FK enforced)    |
+| Data     | Pandas, MT5 OHLCV CSV             |
+| Charts   | Plotly                            |
 
-## Project Structure
-
-```
-Quant-Research-Platform/
-├── backend/
-│   └── main.py              # FastAPI REST API v3.0.0
-├── core/
-│   ├── data_loader.py       # MT5 CSV parser + detect_timeframe() + load_from_dataset_id()
-│   ├── backtest.py          # Sequential no-lookahead execution engine
-│   ├── report.py            # Report & PASS/WATCHLIST/FAIL goal evaluator
-│   ├── export.py            # CSV/JSON export builders + per-research exports
-│   └── modules/
-│       └── liquidity_sweep.py   # Liquidity Sweep strategy
-├── database/
-│   └── db.py                # SQLite schema + CRUD for all 7 tables
-├── frontend/
-│   └── app.py               # Streamlit 4-tab dashboard
-├── data/                    # Auto-created at startup
-│   ├── quant.db             # SQLite database
-│   ├── uploads/             # Legacy uploaded files
-│   └── exports/             # All CSV + JSON exports
-├── requirements.txt
-└── README.md
-```
+---
 
 ## Quick Start
 
-### 1. Install dependencies
 ```bash
-pip install -r requirements.txt
+# Terminal 1 — Backend
+cd "d:\Quant Research Platform\Quant-Research-Platform"
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Terminal 2 — Frontend
+cd "d:\Quant Research Platform\Quant-Research-Platform"
+python -m streamlit run frontend/app.py
 ```
 
-### 2. Start the FastAPI backend (Terminal 1)
-```bash
-uvicorn backend.main:app --reload
+Open `http://localhost:8501` in your browser.
+
+---
+
+## How to Upload OHLCV Files
+
+1. Go to **Run Analysis** → **Upload New Files**.
+2. Drop one or more MT5 OHLCV CSV files.
+   - Expected columns: `Date, Time, Open, High, Low, Close, Volume`
+   - Expected date format: `2024.01.02`
+3. Timeframe is auto-detected from the filename (e.g. `XAUUSD_H1_OHLCV.csv` → H1).
+   Override if detection fails.
+4. Click **Upload & Store Files**.
+   - Duplicate files are detected by SHA-256 hash — re-uploading reuses the existing dataset.
+   - Candles are deduplicated by `(dataset_id, datetime)`.
+5. Uploaded datasets persist in SQLite across server restarts.
+
+---
+
+## How to Reuse Stored Datasets
+
+1. Go to **Run Analysis** → **Use Stored Datasets**.
+2. Select **Single Timeframe** or **Multi-Timeframe** mode.
+3. Pick datasets from the dropdown (shows TF, filename, rows, date range).
+4. Click **Use Selected Datasets**.
+5. Continue to Step 2 (date range) and Step 3 (run).
+
+---
+
+## How to Run Analysis
+
+1. Complete data source selection (upload or stored datasets).
+2. **Step 2 — Date Range & Analysis Mode**
+   - Default: use full dataset range.
+   - Uncheck **Use Full Dataset Range** to enter a custom window.
+   - The selected range must be inside the available dataset range.
+   - Choose analysis mode:
+     - **Full Backtest** — single run, all metrics.
+     - **Yearly Analysis** — year-by-year breakdown in Monthly tab.
+     - **Monthly Analysis** — monthly detail.
+     - **Walk Forward** — split into In-Sample (training) + Out-of-Sample (validation).
+3. **Step 3 — Configure & Run**
+   - Set sidebar parameters: Risk %, RR, Swing Strength.
+   - Optionally name the run.
+   - Click **▶ Run Analysis**.
+4. Results appear in Step 4 with 5 sub-tabs:
+   - **Equity Curve** — cumulative return + pie chart + metrics table
+   - **Drawdown** — drawdown curve with goal limit line
+   - **Monthly** — bar chart; year-by-year table for Yearly mode
+   - **Trades** — full trade log
+   - **Goals** — PASS/WATCHLIST/FAIL for each target metric
+
+### Goal Targets
+
+| Metric         | PASS           | WATCHLIST           |
+|----------------|----------------|---------------------|
+| Monthly Return | 3 % – 5 %      | 1.5 %–3 % or 5%–8% |
+| Max Drawdown   | < 4 %          | 4 % – 6 %           |
+| Profit Factor  | >= 1.5         | 1.2 – 1.49          |
+
+---
+
+## How to View Research History
+
+1. Go to **Research History** tab.
+2. The table shows every completed run: name, date, mode, TF(s), analysis type, date range, metrics, goal status.
+3. Select a run from the dropdown.
+4. **View details** — expander shows the full equity curve, drawdown, monthly breakdown, and trade log.
+5. **Re-run** — expander shows original parameters; click **Re-run now** to re-run with the same settings.
+6. **Delete** — permanently removes the run and all linked trade/monthly records (CASCADE).
+
+---
+
+## How to Export Results
+
+### From Research History tab
+Select a run, then click any of the 4 download buttons:
+- **Trade Log CSV** — all trades for that run
+- **Monthly CSV** — monthly breakdown
+- **Summary CSV** — single-row metrics summary
+- **Full Report JSON** — complete result including equity curve
+
+### From Export Center tab
+- **OHLCV Dataset Exports** — download any stored dataset as MT5-formatted CSV.
+- **Research Run Exports** — same 4 export formats, pick any run.
+- **Cumulative Log Files** (auto-appended every run):
+  - `data/exports/trade_log.csv`
+  - `data/exports/research_summary.csv`
+
+Per-run files are also written to `data/exports/` after each analysis:
+`trade_log_{id}.csv`, `monthly_{id}.csv`, `summary_{id}.csv`, `report_{id}.json`
+
+---
+
+## Platform Health Check
+
+Go to **Platform Health** tab to see:
+
+| Section        | What it shows                                           |
+|----------------|---------------------------------------------------------|
+| Database       | File path, size, connection status, FK enforcement      |
+| Table Counts   | Row counts for all 5 tables                             |
+| Latest Run     | Most recent research run summary                        |
+| Export Folder  | File count and total size under `data/exports/`         |
+| Validation     | Automated checklist of all key platform checks          |
+
+---
+
+## How to Reset Database (Development Only)
+
+Use this to start completely fresh during development. **All data will be deleted.**
+
+**Via Streamlit:**
+1. Go to **Platform Health** tab.
+2. Scroll to **Reset Database — Development Only**.
+3. Check the confirmation checkbox.
+4. Type `RESET` in the text box.
+5. Click **Reset Database**.
+
+**Via API:**
 ```
-API docs: http://localhost:8000/docs
-
-### 3. Start the Streamlit dashboard (Terminal 2)
-```bash
-streamlit run frontend/app.py
-```
-Dashboard: http://localhost:8501
-
-## CSV Format (MT5 Export)
-
-```
-Date,Time,Open,High,Low,Close,Volume
-2024.01.02,01:00,2063.45,2064.12,2062.80,2063.90,342
-```
-
-Export from MT5: **File → Save As → CSV**
-
-## Dashboard Tabs
-
-### Tab 1 — Run Analysis
-
-Choose your data source:
-
-| Source | When to use |
-|--------|-------------|
-| **Upload New Files** | First time using a dataset; files are stored in the library for reuse |
-| **Use Stored Datasets** | Pick a dataset you already uploaded — no need to upload again |
-
-**Upload flow:**
-1. Drag & drop one or more MT5 OHLCV CSV files.
-2. Timeframe is auto-detected from filename (`XAUUSD_H1_OHLCV.csv` → H1).
-3. Override the timeframe via dropdown if needed.
-4. Click **Upload & Store Files** — files are stored in SQLite and the Dataset Library.
-5. Duplicate files are detected by SHA-256 hash; existing datasets are reused automatically.
-
-**Analysis modes:**
-
-| Mode | Description |
-|------|-------------|
-| Single Timeframe | One dataset; Liquidity Sweep runs directly on it |
-| Multi-Timeframe | Assign roles (Trend / Structure / Entry) to different datasets |
-
-### Tab 2 — OHLCV Dataset Library
-
-Shows all stored datasets with:
-- Dataset ID, Symbol, Timeframe, Filename, Row count, Date range, Upload date, Status
-
-Actions per dataset:
-- **Export CSV** — download candles in MT5 format
-- **Delete** — removes dataset and all its candles (with confirmation)
-
-### Tab 3 — Research History
-
-Shows all completed analysis runs with key metrics:
-- Research ID, Name, Date, Module, Mode, Timeframe(s)
-- Trades, Win%, PF, Net R, Monthly%, DD%, Goal Status
-
-Actions per run:
-- **View Details** — expander showing full charts and metrics from the stored report
-- **Export** — download Trade Log CSV, Monthly CSV, Summary CSV, or Full JSON
-- **Re-run** — repeat analysis with same parameters and datasets, save as new run
-- **Delete** — removes run and all associated trades / monthly records (with confirmation)
-
-### Tab 4 — Export Center
-
-Download exports for any dataset or research run without navigating to the individual record:
-- **Dataset Exports** — pick dataset → download MT5-format CSV
-- **Research Run Exports** — pick run → download Trade Log, Monthly Report, Summary, or Full JSON
-
-## Uploaded & Stored Data
-
-### How to upload and store OHLCV data
-
-1. Go to **Run Analysis → Upload New Files**
-2. Drop your CSV files; timeframes are auto-detected
-3. Click **Upload & Store Files**
-4. Files are stored in SQLite (`ohlcv_candles` table) and metadata in `datasets`
-5. Duplicate files (same SHA-256 hash) are detected and the existing dataset is reused
-
-### How to reuse stored datasets
-
-1. Go to **Run Analysis → Use Stored Datasets**
-2. Select one (Single TF) or up to three (Multi-TF: Trend / Structure / Entry)
-3. Configure parameters in the sidebar
-4. Click **Use Selected Datasets** then **Run Analysis**
-
-## Database Tables
-
-| Table | Purpose |
-|-------|---------|
-| `datasets` | OHLCV dataset metadata (symbol, timeframe, filename, SHA-256 hash, row count, date range) |
-| `ohlcv_candles` | Raw candle storage — one row per candle, linked to `datasets` via CASCADE delete |
-| `research_runs` | Every completed analysis run with all metrics and the full report JSON blob |
-| `trade_logs` | Per-trade records for each research run, linked via CASCADE delete |
-| `monthly_reports` | Monthly breakdown rows for each research run, linked via CASCADE delete |
-| `uploads` | Legacy single-file upload metadata (backward compat) |
-| `analyses` | Legacy analysis records (backward compat) |
-
-### Key design decisions
-
-- **Dedup by SHA-256**: uploading the same file twice returns the existing `dataset_id` instead of storing duplicates.
-- **Candle dedup**: `UNIQUE(dataset_id, dt)` prevents duplicate candles within a dataset; `INSERT OR IGNORE` handles conflicts silently.
-- **CASCADE delete**: deleting a dataset removes all its candles; deleting a research run removes all its trades and monthly records.
-- **WAL mode**: SQLite journal mode set to WAL for better concurrent write performance.
-
-## File Naming Convention
-
-| Timeframe | Recommended Filename |
-|-----------|---------------------|
-| M1  | `XAUUSD_M1_OHLCV.csv` |
-| M5  | `XAUUSD_M5_OHLCV.csv` |
-| M15 | `XAUUSD_M15_OHLCV.csv` |
-| M30 | `XAUUSD_M30_OHLCV.csv` |
-| H1  | `XAUUSD_H1_OHLCV.csv` |
-| H4  | `XAUUSD_H4_OHLCV.csv` |
-| D1  | `XAUUSD_D1_OHLCV.csv` |
-
-Files with unrecognised names show ⚠️ — assign the timeframe manually via the dropdown.
-
-## Strategy: Liquidity Sweep
-
-Detects candles that wick through a recent swing high/low and close back on the other side.
-
-- **Bullish sweep**: wick below confirmed N-bar swing low, close above → BUY next candle open
-- **Bearish sweep**: wick above confirmed N-bar swing high, close below → SELL next candle open
-- **Stop**: wick extreme + 0.20 buffer
-- **Target**: entry ± (stop_distance × RR)
-- **No lookahead**: swing at bar *j* only confirmed once bar *j + N* has closed
-
-## Target Goals
-
-| Metric | PASS | WATCHLIST |
-|--------|------|-----------|
-| Monthly Return | 3% – 5% | 1.5%–3% or 5%–8% |
-| Max Drawdown | < 4% | 4%–6% |
-| Profit Factor | ≥ 1.5 | 1.2–1.49 |
-
-## API Reference
-
-### Dataset Library
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/datasets` | Upload CSV → hash-dedup → store candles → return `dataset_id` |
-| GET | `/api/v1/datasets` | List all stored datasets |
-| DELETE | `/api/v1/datasets/{id}` | Delete dataset and all its candles |
-| GET | `/api/v1/datasets/{id}/export` | Download dataset as MT5-format CSV |
-
-### Analysis
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/analyze` | Run strategy; accepts `dataset_id` or `dataset_ids` (stored) or `upload_id` (legacy) |
-
-**Single TF (stored dataset):**
-```json
-{
-  "dataset_id": "<dataset_id>",
-  "analysis_mode": "single",
-  "module": "liquidity_sweep",
-  "timeframe": "H1",
-  "risk_pct": 1.0,
-  "rr": 2.0,
-  "lookback": 5,
-  "research_name": "XAUUSD H1 Jan 2024"
-}
+POST http://localhost:8000/api/v1/admin/reset-db?confirm=RESET
 ```
 
-**Multi-TF (stored datasets):**
-```json
-{
-  "dataset_ids": {
-    "H4": "<dataset_id>",
-    "H1": "<dataset_id>",
-    "M15": "<dataset_id>"
-  },
-  "analysis_mode": "multi",
-  "trend_tf": "H4",
-  "structure_tf": "H1",
-  "entry_tf": "M15",
-  "module": "liquidity_sweep",
-  "risk_pct": 1.0,
-  "rr": 2.0,
-  "lookback": 5
-}
+After reset, all tables are recreated with the correct schema.
+The FK schema check runs automatically on startup to detect and repair stale schemas.
+
+---
+
+## Database Schema
+
+```
+datasets         — dataset metadata (one row per uploaded file)
+ohlcv_candles    — raw candle storage  FK -> datasets.dataset_id  CASCADE
+research_runs    — analysis history
+trade_logs       — per-trade records   FK -> research_runs.research_id  CASCADE
+monthly_reports  — monthly breakdown   FK -> research_runs.research_id  CASCADE
 ```
 
-### Research History
+Foreign keys are enforced with `PRAGMA foreign_keys = ON`.
+FK schema is validated on every startup via `PRAGMA foreign_key_list()` and auto-repaired if stale.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/research` | List all research runs |
-| GET | `/api/v1/research/{id}` | Full research run detail |
-| DELETE | `/api/v1/research/{id}` | Delete run (cascades trades + monthly) |
-| GET | `/api/v1/research/{id}/trades` | Trade log for a run |
-| GET | `/api/v1/research/{id}/monthly` | Monthly breakdown for a run |
-| GET | `/api/v1/research/{id}/export/{fmt}` | fmt: `trade_log` \| `monthly` \| `summary` \| `report` |
+---
 
-## Exports
+## Directory Layout
 
-All export files are written to `data/exports/`:
+```
+backend/
+  main.py               FastAPI app, all API endpoints
+core/
+  data_loader.py        MT5 CSV parser, validator, TF detector
+  report.py             Performance report generator
+  export.py             CSV/JSON export utilities
+  modules/
+    liquidity_sweep.py  Liquidity Sweep backtest engine
+database/
+  db.py                 SQLite helpers, schema init, health/reset
+frontend/
+  app.py                Streamlit dashboard (5 tabs)
+data/
+  quant.db              SQLite database (auto-created)
+  exports/              All CSV/JSON export files
+  uploads/              Legacy uploaded CSV files
+```
 
-| File | Contents |
-|------|----------|
-| `trade_log.csv` | All trades across all runs (appended) |
-| `research_summary.csv` | One row per analysis run (appended) |
-| `trade_log_{id}.csv` | Trade log for a specific research run |
-| `monthly_{id}.csv` | Monthly breakdown for a specific run |
-| `summary_{id}.csv` | Summary row for a specific run |
-| `report_{id}.json` | Full research report JSON for a specific run |
+---
+
+## Known Limitations
+
+- Walk Forward uses two separate API calls (IS + OOS); not a single atomic operation.
+- Multi-TF analysis requires all TFs to share a common date range.
+- No live market data connection — manual MT5 CSV export required.
+- Weekend/holiday gaps in MT5 data produce warnings (harmless, analysis proceeds).
+- Database reset is unprotected beyond the `?confirm=RESET` parameter — add auth before any production deployment.
