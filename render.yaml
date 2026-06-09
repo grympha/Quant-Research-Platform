@@ -1,0 +1,16 @@
+services:
+  # ── Streamlit-only deployment (no FastAPI backend needed) ──────────────────
+  - type: web
+    name: quant-research-platform
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run frontend/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      # API_BASE_URL is intentionally NOT set here — that activates streamlit_only mode.
+      # If you later deploy a separate FastAPI backend, add:
+      #   - key: API_BASE_URL
+      #     value: https://your-backend.onrender.com

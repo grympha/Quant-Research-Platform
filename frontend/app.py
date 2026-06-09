@@ -15,12 +15,21 @@ import time
 from datetime import date, timedelta, timezone
 from pathlib import Path
 
+import os
+import sys
+from pathlib import Path as _Path
+
+# Make frontend/ importable regardless of cwd
+sys.path.insert(0, str(_Path(__file__).parent))
+import services as svc  # noqa: E402
+
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-API = "http://localhost:8000"
+# API_BASE_URL is consumed by services.py; kept here only for legacy reference.
+API = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 
 GOAL_MR_MIN = 3.0
 GOAL_MR_MAX = 5.0
@@ -114,22 +123,20 @@ with col_t:
     st.title("📊 Quant Research Platform")
     st.caption("v3.2 — Phase 1.5 Stability · Platform Health · Reset DB")
 with col_s:
-    try:
-        r = requests.get(f"{API}/health", timeout=2)
-        info = r.json()
-        st.success(f"API v{info.get('version','?')}  🟢", icon=None)
-    except Exception:
-        st.error("API offline — run uvicorn", icon="🔴")
+    if svc.RUN_MODE == "streamlit_only":
+        st.success("Local Engine Active  🟢", icon=None)
+    else:
+        try:
+            _hi = svc.health()
+            st.success(f"API v{_hi.get('version','?')}  🟢", icon=None)
+        except Exception:
+            st.error("API offline — run uvicorn", icon="🔴")
 
 # ── Goal profile loader (defined early — called at sidebar level before helpers) ──
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _fetch_goal_profiles() -> list[dict]:
-    try:
-        r = requests.get(f"{API}/api/v1/goals/profiles", timeout=5)
-        return r.json().get("profiles", []) if r.status_code == 200 else []
-    except Exception:
-        return []
+    return svc.list_goal_profiles()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -251,25 +258,17 @@ def _dataset_label(d: dict) -> str:
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_datasets() -> list[dict]:
     t0 = time.perf_counter()
-    try:
-        r = requests.get(f"{API}/api/v1/datasets", timeout=5)
-        result = r.json().get("datasets", []) if r.status_code == 200 else []
-        print(f"[perf] _fetch_datasets cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} datasets)", flush=True)
-        return result
-    except Exception:
-        return []
+    result = svc.list_datasets()
+    print(f"[perf] _fetch_datasets cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} datasets)", flush=True)
+    return result
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _fetch_research_runs(limit: int = 50) -> list[dict]:
     t0 = time.perf_counter()
-    try:
-        r = requests.get(f"{API}/api/v1/research?limit={limit}", timeout=5)
-        result = r.json().get("research_runs", []) if r.status_code == 200 else []
-        print(f"[perf] _fetch_research_runs cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} runs)", flush=True)
-        return result
-    except Exception:
-        return []
+    result = svc.list_research_runs(limit)
+    print(f"[perf] _fetch_research_runs cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} runs)", flush=True)
+    return result
 
 
 def _clear_data_cache() -> None:
@@ -771,21 +770,7 @@ with tab1:
                                 })
                                 continue
                             try:
-                                resp = requests.post(
-                                    f"{API}/api/v1/datasets",
-                                    files={"file": (f.name, f.getvalue(), "text/csv")},
-                                    params={"timeframe": tf}, timeout=60,
-                                )
-                            except requests.exceptions.ConnectionError:
-                                new_status.append({
-                                    "Timeframe": tf, "Filename": f.name,
-                                    "Rows": "—", "Start": "—", "End": "—",
-                                    "Status": "❌ Connection error",
-                                })
-                                continue
-
-                            if resp.status_code == 200:
-                                info2 = resp.json()
+                                info2 = svc.upload_dataset(f.getvalue(), f.name, tf)
                                 warns = len(info2.get("validation", {}).get("warnings", []))
                                 new_datasets[tf] = info2["dataset_id"]
                                 new_status.append({
@@ -797,40 +782,35 @@ with tab1:
                                     "Status":     "✅ Stored" if warns == 0 else f"⚠️ {warns} warning(s)",
                                     "Dataset ID": info2["dataset_id"][:8],
                                 })
-                            elif resp.status_code == 409:
-                                try:
-                                    detail = resp.json().get("detail", {})
-                                    eid = detail.get("existing_dataset_id", "")
-                                    etf = detail.get("existing_timeframe", tf)
-                                    new_datasets[tf] = eid
+                            except svc.SvcError as _e:
+                                if _e.status_code == 409:
+                                    _d  = _e.detail
+                                    eid = _d.get("existing_dataset_id", "")
+                                    etf = _d.get("existing_timeframe", tf)
+                                    if eid:
+                                        new_datasets[tf] = eid
+                                        new_status.append({
+                                            "Timeframe": tf, "Filename": f.name,
+                                            "Rows": "—", "Start": "—", "End": "—",
+                                            "Status":     f"♻️ Reusing existing ({eid[:8]})",
+                                            "Dataset ID": eid[:8],
+                                        })
+                                        st.warning(
+                                            f"⚠️ **{f.name}** already in library — "
+                                            f"reusing existing {etf} dataset."
+                                        )
+                                    else:
+                                        new_status.append({
+                                            "Timeframe": tf, "Filename": f.name,
+                                            "Rows": "—", "Start": "—", "End": "—",
+                                            "Status": "❌ Duplicate detected", "Dataset ID": "—",
+                                        })
+                                else:
                                     new_status.append({
                                         "Timeframe": tf, "Filename": f.name,
                                         "Rows": "—", "Start": "—", "End": "—",
-                                        "Status":     f"♻️ Reusing existing ({eid[:8]})",
-                                        "Dataset ID": eid[:8],
+                                        "Status": f"❌ {_e.message}", "Dataset ID": "—",
                                     })
-                                    st.warning(
-                                        f"⚠️ **{f.name}** already in library — "
-                                        f"reusing existing {etf} dataset."
-                                    )
-                                except Exception:
-                                    new_status.append({
-                                        "Timeframe": tf, "Filename": f.name,
-                                        "Rows": "—", "Start": "—", "End": "—",
-                                        "Status": "❌ Duplicate detected", "Dataset ID": "—",
-                                    })
-                            else:
-                                try:
-                                    detail = resp.json().get("detail", "upload error")
-                                    if isinstance(detail, dict):
-                                        detail = detail.get("message", str(detail))
-                                except Exception:
-                                    detail = "upload error"
-                                new_status.append({
-                                    "Timeframe": tf, "Filename": f.name,
-                                    "Rows": "—", "Start": "—", "End": "—",
-                                    "Status": f"❌ {detail}", "Dataset ID": "—",
-                                })
 
                     st.session_state["_tf_datasets"]  = new_datasets
                     st.session_state["_upload_status"] = new_status
@@ -1193,41 +1173,25 @@ with tab1:
             return p
 
         if sub_mode_label == "Walk Forward Analysis" and wf_split_date:
-            # ── Two API calls: IS then OOS ──────────────────────────────────
+            # ── Two runs: IS then OOS ───────────────────────────────────────
             oos_start_date = wf_split_date + timedelta(days=1)
             is_payload  = _make_payload(" [IS]",  bt_start_str, str(wf_split_date))
             oos_payload = _make_payload(" [OOS]", str(oos_start_date), bt_end_str)
 
             with st.spinner("Walk Forward — running In-Sample period…"):
                 try:
-                    is_resp = requests.post(f"{API}/api/v1/analyze", json=is_payload, timeout=120)
-                except requests.exceptions.ConnectionError:
-                    st.error("Lost connection to backend.")
+                    is_result = svc.run_analysis(is_payload)
+                except svc.SvcError as _e:
+                    st.error(f"In-Sample failed: {_e.message}")
                     st.stop()
-            if is_resp.status_code != 200:
-                try:
-                    detail = is_resp.json().get("detail", is_resp.text)
-                except Exception:
-                    detail = is_resp.text
-                st.error(f"In-Sample failed ({is_resp.status_code}): {detail}")
-                st.stop()
 
             with st.spinner("Walk Forward — running Out-of-Sample period…"):
                 try:
-                    oos_resp = requests.post(f"{API}/api/v1/analyze", json=oos_payload, timeout=120)
-                except requests.exceptions.ConnectionError:
-                    st.error("Lost connection to backend.")
+                    oos_result = svc.run_analysis(oos_payload)
+                except svc.SvcError as _e:
+                    st.error(f"Out-of-Sample failed: {_e.message}")
                     st.stop()
-            if oos_resp.status_code != 200:
-                try:
-                    detail = oos_resp.json().get("detail", oos_resp.text)
-                except Exception:
-                    detail = oos_resp.text
-                st.error(f"Out-of-Sample failed ({oos_resp.status_code}): {detail}")
-                st.stop()
 
-            is_result  = is_resp.json()
-            oos_result = oos_resp.json()
             st.session_state["analysis_wf"] = {
                 "is":  is_result,
                 "oos": oos_result,
@@ -1243,33 +1207,24 @@ with tab1:
             )
 
         else:
-            # ── Single API call ─────────────────────────────────────────────
+            # ── Single run ──────────────────────────────────────────────────
             payload = _make_payload("", bt_start_str, bt_end_str)
-            _t_run = time.perf_counter()
+            _t_run  = time.perf_counter()
             with st.spinner("Running backtest — detecting swings, executing trades…"):
                 try:
-                    resp = requests.post(f"{API}/api/v1/analyze", json=payload, timeout=120)
-                except requests.exceptions.ConnectionError:
-                    st.error("Lost connection to backend.")
+                    _result = svc.run_analysis(payload)
+                except svc.SvcError as _e:
+                    st.error(f"Analysis failed: {_e.message}")
                     st.stop()
-            print(f"[perf] /analyze request: {(time.perf_counter()-_t_run)*1000:.0f}ms", flush=True)
+            print(f"[perf] run_analysis: {(time.perf_counter()-_t_run)*1000:.0f}ms", flush=True)
 
-            if resp.status_code == 200:
-                _result = resp.json()
-                st.session_state["analysis"] = _result
-                st.session_state.pop("analysis_wf", None)
-                _clear_data_cache()
-                st.success(
-                    f"Analysis complete — "
-                    f"Research ID: **{_result.get('research_id','')[:8]}**"
-                )
-            else:
-                try:
-                    detail = resp.json().get("detail", resp.text)
-                except Exception:
-                    detail = resp.text
-                st.error(f"Analysis failed ({resp.status_code}): {detail}")
-                st.stop()
+            st.session_state["analysis"] = _result
+            st.session_state.pop("analysis_wf", None)
+            _clear_data_cache()
+            st.success(
+                f"Analysis complete — "
+                f"Research ID: **{_result.get('research_id','')[:8]}**"
+            )
 
     # ── Step 4 — Results ──────────────────────────────────────────────────────
     if "analysis_wf" in st.session_state:
@@ -1370,15 +1325,12 @@ with tab2:
         col_a, col_b, col_c = st.columns([1, 1, 3])
         with col_a:
             try:
-                exp_resp = requests.get(f"{API}/api/v1/datasets/{sel_id}/export", timeout=30)
-                if exp_resp.status_code == 200:
-                    st.download_button(
-                        "⬇️  Export CSV", data=exp_resp.content,
-                        file_name=f"{sel_d['symbol']}_{sel_d['timeframe']}_{sel_id[:8]}.csv",
-                        mime="text/csv", key=f"dl_{sel_id}",
-                    )
-                else:
-                    st.button("⬇️  Export CSV", disabled=True)
+                _exp_bytes = svc.export_dataset_csv(sel_id)
+                st.download_button(
+                    "⬇️  Export CSV", data=_exp_bytes,
+                    file_name=f"{sel_d['symbol']}_{sel_d['timeframe']}_{sel_id[:8]}.csv",
+                    mime="text/csv", key=f"dl_{sel_id}",
+                )
             except Exception:
                 st.button("⬇️  Export CSV", disabled=True)
 
@@ -1400,14 +1352,14 @@ with tab2:
             )
             cc1, cc2 = st.columns(2)
             if cc1.button("✅ Yes, delete", type="primary", key="confirm_del"):
-                dr = requests.delete(f"{API}/api/v1/datasets/{sel_id}", timeout=10)
-                if dr.status_code == 200:
+                try:
+                    svc.delete_dataset(sel_id)
                     st.success("Dataset deleted.")
                     st.session_state.pop("_confirm_delete_dataset", None)
                     _clear_data_cache()
                     st.rerun()
-                else:
-                    st.error("Delete failed.")
+                except svc.SvcError as _e:
+                    st.error(f"Delete failed: {_e.message}")
             if cc2.button("✗ Cancel", key="cancel_del"):
                 st.session_state.pop("_confirm_delete_dataset", None)
 
@@ -1486,12 +1438,10 @@ with tab3:
         ]:
             with col:
                 try:
-                    er = requests.get(
-                        f"{API}/api/v1/research/{sel_rid}/export/{fmt}", timeout=15
-                    )
+                    _eb = svc.export_research(sel_rid, fmt)
                     ext = "json" if fmt == "report" else "csv"
                     col.download_button(
-                        f"⬇️ {label}", data=er.content,
+                        f"⬇️ {label}", data=_eb,
                         file_name=f"{fmt}_{sel_rid[:8]}.{ext}",
                         mime=mime, key=f"dl_{fmt}_{sel_rid}",
                     )
@@ -1506,8 +1456,7 @@ with tab3:
             st.warning("Delete this research run and all associated trade records?")
             dc1, dc2 = st.columns(2)
             if dc1.button("✅ Yes, delete", type="primary", key="confirm_del_run"):
-                dr2 = requests.delete(f"{API}/api/v1/research/{sel_rid}", timeout=10)
-                if dr2.status_code == 200:
+                if svc.delete_research_run(sel_rid):
                     st.success("Research run deleted.")
                     st.session_state.pop("_confirm_delete_run", None)
                     _clear_data_cache()
@@ -1523,9 +1472,8 @@ with tab3:
         with view_col:
             with st.expander(f"🔍 View details — {sel_run.get('research_name','—')[:40]}"):
                 try:
-                    detail_resp = requests.get(f"{API}/api/v1/research/{sel_rid}", timeout=10)
-                    if detail_resp.status_code == 200:
-                        run_detail = detail_resp.json()
+                    run_detail = svc.get_research_run(sel_rid)
+                    if run_detail:
                         full_rpt   = json.loads(run_detail.get("full_report") or "{}")
                         if full_rpt:
                             dm1, dm2 = st.columns(2)
@@ -1565,9 +1513,8 @@ with tab3:
         with rerun_col:
             with st.expander("🔄 Re-run with same parameters"):
                 try:
-                    dr3 = requests.get(f"{API}/api/v1/research/{sel_rid}", timeout=10)
-                    if dr3.status_code == 200:
-                        rd      = dr3.json()
+                    rd = svc.get_research_run(sel_rid)
+                    if rd:
                         did_map = json.loads(rd.get("dataset_ids_used", "{}"))
                         st.markdown(
                             f"**Module:** {rd['selected_module'].replace('_',' ').title()}  \n"
@@ -1617,26 +1564,14 @@ with tab3:
 
                                 with st.spinner("Re-running analysis…"):
                                     try:
-                                        rr_resp = requests.post(
-                                            f"{API}/api/v1/analyze", json=rr_payload, timeout=120,
+                                        rerun_result = svc.run_analysis(rr_payload)
+                                        st.success(
+                                            f"Re-run complete — "
+                                            f"ID: {rerun_result.get('research_id','')[:8]}"
                                         )
-                                    except Exception:
-                                        st.error("Connection error.")
-                                        st.stop()
-
-                                if rr_resp.status_code == 200:
-                                    rerun_result = rr_resp.json()
-                                    st.success(
-                                        f"Re-run complete — "
-                                        f"ID: {rerun_result.get('research_id','')[:8]}"
-                                    )
-                                    _render_results(rerun_result, rd["risk_percent"])
-                                else:
-                                    try:
-                                        d = rr_resp.json().get("detail", rr_resp.text)
-                                    except Exception:
-                                        d = rr_resp.text
-                                    st.error(f"Re-run failed: {d}")
+                                        _render_results(rerun_result, rd["risk_percent"])
+                                    except svc.SvcError as _e:
+                                        st.error(f"Re-run failed: {_e.message}")
                 except Exception as exc:
                     st.error(f"Could not load run: {exc}")
 
@@ -1660,18 +1595,15 @@ with tab4:
         exp_d   = exp_datasets[exp_idx]
         exp_did = exp_d["dataset_id"]
         try:
-            er2 = requests.get(f"{API}/api/v1/datasets/{exp_did}/export", timeout=30)
-            if er2.status_code == 200:
-                fname = f"{exp_d['symbol']}_{exp_d['timeframe']}_{exp_did[:8]}.csv"
-                st.download_button(
-                    f"⬇️  Download {exp_d['symbol']} {exp_d['timeframe']} CSV "
-                    f"({exp_d['total_rows']:,} rows)",
-                    data=er2.content, file_name=fname, mime="text/csv", type="primary",
-                )
-            else:
-                st.error("Export failed.")
-        except Exception:
-            st.error("Could not connect to backend.")
+            _exp_b = svc.export_dataset_csv(exp_did)
+            fname  = f"{exp_d['symbol']}_{exp_d['timeframe']}_{exp_did[:8]}.csv"
+            st.download_button(
+                f"⬇️  Download {exp_d['symbol']} {exp_d['timeframe']} CSV "
+                f"({exp_d['total_rows']:,} rows)",
+                data=_exp_b, file_name=fname, mime="text/csv", type="primary",
+            )
+        except svc.SvcError as _e:
+            st.error(f"Export failed: {_e.message}")
 
     st.divider()
 
@@ -1714,11 +1646,9 @@ with tab4:
         ]:
             with col:
                 try:
-                    er3 = requests.get(
-                        f"{API}/api/v1/research/{exp_rid}/export/{fmt}", timeout=15
-                    )
+                    _eb2 = svc.export_research(exp_rid, fmt)
                     col.download_button(
-                        f"⬇️ {label}", data=er3.content,
+                        f"⬇️ {label}", data=_eb2,
                         file_name=f"{fmt}_{exp_rid[:8]}.{ext}",
                         mime=mime, key=f"exp_{fmt}_{exp_rid}",
                     )
@@ -1750,12 +1680,9 @@ with tab5:
     if st.button("🔄 Refresh", key="health_refresh"):
         st.rerun()
 
-    # ── DB Health from API ────────────────────────────────────────────────────
-    try:
-        h_resp = requests.get(f"{API}/api/v1/health/db", timeout=5)
-        h = h_resp.json() if h_resp.status_code == 200 else {}
-    except Exception:
-        h = {}
+    # ── DB Health ─────────────────────────────────────────────────────────────
+    h = svc.db_health()
+    if not h and svc.RUN_MODE == "api":
         st.error("Cannot reach backend — is uvicorn running on port 8000?")
 
     st.markdown("### 🗄️ Database")
@@ -1885,19 +1812,14 @@ with tab5:
         key="reset_db_btn",
     ):
         try:
-            rr = requests.post(
-                f"{API}/api/v1/admin/reset-db?confirm=RESET", timeout=30
-            )
-            if rr.status_code == 200:
-                st.success("✅ Database reset complete. All tables recreated.")
-                _clear_data_cache()
-                for k in list(st.session_state.keys()):
-                    st.session_state.pop(k, None)
-                st.rerun()
-            else:
-                st.error(f"Reset failed ({rr.status_code}): {rr.text}")
-        except Exception as exc:
-            st.error(f"Connection error: {exc}")
+            svc.reset_db("RESET")
+            st.success("✅ Database reset complete. All tables recreated.")
+            _clear_data_cache()
+            for k in list(st.session_state.keys()):
+                st.session_state.pop(k, None)
+            st.rerun()
+        except svc.SvcError as _e:
+            st.error(f"Reset failed: {_e.message}")
 
 
 # ═════════════════════════ TAB 6 — COMPARE MODULES ════════════════════════════
@@ -2076,22 +1998,13 @@ with tab6:
         _t_cmp = time.perf_counter()
         with st.spinner("Running comparison — both modules on the same dataset…"):
             try:
-                cmp_resp = requests.post(f"{API}/api/v1/compare", json=cmp_payload, timeout=180)
-            except requests.exceptions.ConnectionError:
-                st.error("Lost connection to backend.")
-                st.stop()
-        print(f"[perf] /compare request: {(time.perf_counter()-_t_cmp)*1000:.0f}ms", flush=True)
-
-        if cmp_resp.status_code == 200:
-            st.session_state["cmp_result"] = cmp_resp.json()
-            _clear_data_cache()
-            st.success("Comparison complete!")
-        else:
-            try:
-                detail = cmp_resp.json().get("detail", cmp_resp.text)
-            except Exception:
-                detail = cmp_resp.text
-            st.error(f"Comparison failed ({cmp_resp.status_code}): {detail}")
+                _cmp_result = svc.run_comparison(cmp_payload)
+                st.session_state["cmp_result"] = _cmp_result
+                _clear_data_cache()
+                st.success("Comparison complete!")
+            except svc.SvcError as _e:
+                st.error(f"Comparison failed: {_e.message}")
+        print(f"[perf] run_comparison: {(time.perf_counter()-_t_cmp)*1000:.0f}ms", flush=True)
 
     # ── Display results ───────────────────────────────────────────────────────
     _MOD_LABEL = {"liquidity_sweep": "Liquidity Sweep", "break_retest": "Break & Retest"}
@@ -2201,17 +2114,12 @@ with tab7:
                 st.button("⭐ Already Default", disabled=True, key="gp_set_default_btn")
             elif st.button("⭐ Set as Default", key="gp_set_default_btn", type="secondary"):
                 try:
-                    r = requests.post(
-                        f"{API}/api/v1/goals/profiles/{gp_sel_id}/set-default", timeout=10
-                    )
-                    if r.status_code == 200:
-                        st.success(f"'{gp_sel['profile_name']}' is now the default profile.")
-                        _clear_data_cache()
-                        st.rerun()
-                    else:
-                        st.error(f"Failed: {r.text}")
-                except Exception as exc:
-                    st.error(f"Connection error: {exc}")
+                    svc.set_default_goal_profile(gp_sel_id)
+                    st.success(f"'{gp_sel['profile_name']}' is now the default profile.")
+                    _clear_data_cache()
+                    st.rerun()
+                except svc.SvcError as _e:
+                    st.error(f"Failed: {_e.message}")
 
         # ── Delete ────────────────────────────────────────────────────────────
         with gpb_col:
@@ -2226,22 +2134,13 @@ with tab7:
             dgc1, dgc2 = st.columns(2)
             if dgc1.button("✅ Yes, delete", type="primary", key="gp_del_confirm"):
                 try:
-                    dr = requests.delete(
-                        f"{API}/api/v1/goals/profiles/{gp_sel_id}", timeout=10
-                    )
-                    if dr.status_code == 200:
-                        st.success("Profile deleted.")
-                        st.session_state.pop("_confirm_delete_gp", None)
-                        _clear_data_cache()
-                        st.rerun()
-                    else:
-                        try:
-                            err = dr.json().get("detail", dr.text)
-                        except Exception:
-                            err = dr.text
-                        st.error(f"Delete failed: {err}")
-                except Exception as exc:
-                    st.error(f"Connection error: {exc}")
+                    svc.delete_goal_profile(gp_sel_id)
+                    st.success("Profile deleted.")
+                    st.session_state.pop("_confirm_delete_gp", None)
+                    _clear_data_cache()
+                    st.rerun()
+                except svc.SvcError as _e:
+                    st.error(f"Delete failed: {_e.message}")
             if dgc2.button("✗ Cancel", key="gp_del_cancel"):
                 st.session_state.pop("_confirm_delete_gp", None)
 
@@ -2272,25 +2171,18 @@ with tab7:
                         st.error("Profile name cannot be empty.")
                     else:
                         try:
-                            ur = requests.put(
-                                f"{API}/api/v1/goals/profiles/{gp_sel_id}",
-                                json={
-                                    "profile_name":            ep_name.strip(),
-                                    "monthly_return_target":   ep_mr,
-                                    "daily_drawdown_target":   ep_ddd,
-                                    "monthly_drawdown_target": ep_mdd,
-                                    "profit_factor_target":    ep_pf,
-                                },
-                                timeout=10,
-                            )
-                            if ur.status_code == 200:
-                                st.success("Profile updated.")
-                                _clear_data_cache()
-                                st.rerun()
-                            else:
-                                st.error(f"Update failed: {ur.text}")
-                        except Exception as exc:
-                            st.error(f"Connection error: {exc}")
+                            svc.update_goal_profile(gp_sel_id, {
+                                "profile_name":            ep_name.strip(),
+                                "monthly_return_target":   ep_mr,
+                                "daily_drawdown_target":   ep_ddd,
+                                "monthly_drawdown_target": ep_mdd,
+                                "profit_factor_target":    ep_pf,
+                            })
+                            st.success("Profile updated.")
+                            _clear_data_cache()
+                            st.rerun()
+                        except svc.SvcError as _e:
+                            st.error(f"Update failed: {_e.message}")
 
     # ── Create New Profile ────────────────────────────────────────────────────
     st.divider()
@@ -2320,30 +2212,19 @@ with tab7:
                 st.error("Profile name cannot be empty.")
             else:
                 try:
-                    cr = requests.post(
-                        f"{API}/api/v1/goals/profiles",
-                        json={
-                            "profile_name":            np_name.strip(),
-                            "monthly_return_target":   np_mr,
-                            "daily_drawdown_target":   np_ddd,
-                            "monthly_drawdown_target": np_mdd,
-                            "profit_factor_target":    np_pf,
-                            "is_default":              np_default,
-                        },
-                        timeout=10,
-                    )
-                    if cr.status_code == 200:
-                        st.success(f"Profile '{np_name.strip()}' created.")
-                        _clear_data_cache()
-                        st.rerun()
-                    else:
-                        try:
-                            err = cr.json().get("detail", cr.text)
-                        except Exception:
-                            err = cr.text
-                        st.error(f"Create failed: {err}")
-                except Exception as exc:
-                    st.error(f"Connection error: {exc}")
+                    svc.create_goal_profile({
+                        "profile_name":            np_name.strip(),
+                        "monthly_return_target":   np_mr,
+                        "daily_drawdown_target":   np_ddd,
+                        "monthly_drawdown_target": np_mdd,
+                        "profit_factor_target":    np_pf,
+                        "is_default":              np_default,
+                    })
+                    st.success(f"Profile '{np_name.strip()}' created.")
+                    _clear_data_cache()
+                    st.rerun()
+                except svc.SvcError as exc:
+                    st.error(f"Create failed: {exc.message}")
 
     # ── How PASS/WATCHLIST/FAIL Works ─────────────────────────────────────────
     st.divider()
