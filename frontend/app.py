@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, timedelta
+import time
+from datetime import date, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -49,6 +50,35 @@ _SUB_MODE_API = {
     "Monthly Analysis":       "monthly",
     "Walk Forward Analysis":  "walk_forward",
 }
+
+_MYT = timezone(timedelta(hours=8))   # Malaysia Time = UTC+8, no DST
+
+_MODULE_LABELS: dict[str, str] = {
+    "liquidity_sweep": "Liquidity Sweep",
+    "break_retest":    "Break & Retest",
+}
+
+
+def _to_myt(utc_str: str | None) -> str:
+    """Convert a UTC ISO datetime string → DD-MM-YYYY HH:mm MYT."""
+    if not utc_str:
+        return "—"
+    try:
+        ts = pd.Timestamp(utc_str)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ts_myt = ts.tz_convert(_MYT)
+        return ts_myt.strftime("%d-%m-%Y %H:%M") + " MYT"
+    except Exception:
+        return str(utc_str)[:16].replace("T", " ")
+
+
+def _module_label(module_id: str | None) -> str:
+    """Human-readable module name; falls back gracefully for old records."""
+    if not module_id:
+        return "Unknown / Legacy Run"
+    return _MODULE_LABELS.get(module_id, module_id.replace("_", " ").title())
+
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -91,56 +121,110 @@ with col_s:
     except Exception:
         st.error("API offline — run uvicorn", icon="🔴")
 
+# ── Goal profile loader (defined early — called at sidebar level before helpers) ──
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_goal_profiles() -> list[dict]:
+    try:
+        r = requests.get(f"{API}/api/v1/goals/profiles", timeout=5)
+        return r.json().get("profiles", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+_sidebar_profiles = _fetch_goal_profiles()
+_sidebar_pids     = [p["id"] for p in _sidebar_profiles]
+_sidebar_default  = next((p for p in _sidebar_profiles if p.get("is_default")), _sidebar_profiles[0] if _sidebar_profiles else None)
+
 with st.sidebar:
     st.header("⚙️ Strategy Parameters")
 
-    st.subheader("Module")
-    module = st.selectbox(
-        "module",
-        ["liquidity_sweep", "break_retest"],
-        format_func=lambda x: {"liquidity_sweep": "Liquidity Sweep",
-                                "break_retest":   "Break & Retest"}.get(x, x),
-        label_visibility="collapsed",
+    # Performance mode toggle — outside form so it reacts immediately
+    perf_mode = st.toggle(
+        "⚡ Fast Mode",
+        value=st.session_state.get("perf_mode", False),
+        help="Hides heavy charts for faster rendering. Disable to see full equity/drawdown charts.",
     )
+    st.session_state["perf_mode"] = perf_mode
 
-    st.subheader("Risk per Trade")
-    risk_pct = st.slider("risk", 0.25, 3.0, 1.0, 0.25,
-                         format="%.2f%%", label_visibility="collapsed")
+    st.divider()
 
-    st.subheader("Risk : Reward")
-    rr = st.slider("rr", 1.0, 5.0, 2.0, 0.5,
-                   format="%.1fR", label_visibility="collapsed")
+    # Strategy params form — changes don't trigger reruns until Apply is clicked
+    with st.form("strategy_params", border=False):
+        st.markdown("**Module**")
+        module = st.selectbox(
+            "module",
+            ["liquidity_sweep", "break_retest"],
+            format_func=lambda x: _MODULE_LABELS.get(x, x),
+            label_visibility="collapsed",
+        )
 
-    st.subheader("Swing Strength (N bars each side)")
-    lookback = st.slider("lookback", 2, 20, 5, 1,
-                         label_visibility="collapsed",
-                         help="Higher = only major pivots; lower = more sensitive swings.")
+        st.markdown("**Risk per Trade**")
+        risk_pct = st.slider("risk", 0.25, 3.0, 1.0, 0.25,
+                             format="%.2f%%", label_visibility="collapsed")
 
-    # Break & Retest specific params (shown only when that module is selected)
-    breakout_buffer  = 0.10
-    retest_tolerance = 0.50
-    if module == "break_retest":
+        st.markdown("**Risk : Reward**")
+        rr = st.slider("rr", 1.0, 5.0, 2.0, 0.5,
+                       format="%.1fR", label_visibility="collapsed")
+
+        st.markdown("**Swing Strength (N bars each side)**")
+        lookback = st.slider(
+            "lookback", 2, 20, 5, 1,
+            label_visibility="collapsed",
+            help="Higher = only major pivots; lower = more sensitive swings.",
+        )
+
         st.divider()
-        st.subheader("Break & Retest Params")
+        st.markdown("**Break & Retest Params**")
+        st.caption("Applied only when Break & Retest module is selected.")
         breakout_buffer = st.slider(
-            "Breakout Buffer (price units)",
+            "Breakout Buffer",
             min_value=0.0, max_value=2.0, value=0.10, step=0.05,
             key="breakout_buffer",
             help="Minimum distance the close must exceed the swing level to register a breakout.",
         )
         retest_tolerance = st.slider(
-            "Retest Tolerance (price units)",
+            "Retest Tolerance",
             min_value=0.0, max_value=2.0, value=0.50, step=0.05,
             key="retest_tolerance",
             help="How close the retest wick must get to the broken level.",
         )
 
+        st.divider()
+        st.markdown("**🎯 Goal Configuration**")
+        if _sidebar_pids:
+            _def_idx = _sidebar_pids.index(_sidebar_default["id"]) if _sidebar_default else 0
+            goal_profile_id = st.selectbox(
+                "goal_profile",
+                _sidebar_pids,
+                index=_def_idx,
+                format_func=lambda pid: next(
+                    (p["profile_name"] for p in _sidebar_profiles if p["id"] == pid),
+                    "Unknown",
+                ),
+                label_visibility="collapsed",
+                key="sidebar_goal_profile",
+            )
+        else:
+            goal_profile_id = None
+            st.caption("No profiles found — backend may be offline.")
+
+        st.form_submit_button("✅ Apply Settings", use_container_width=True, type="primary")
+
+    # Dynamic goal targets display based on currently selected profile
+    _sel_prof = next((p for p in _sidebar_profiles if p.get("id") == goal_profile_id), _sidebar_default)
     st.divider()
-    st.markdown("**🎯 Target Goals**")
-    st.markdown(f"- Monthly Return &nbsp; **{GOAL_MR_MIN}%–{GOAL_MR_MAX}%**")
-    st.markdown(f"- Max Drawdown &nbsp;&nbsp; **< {GOAL_DD_LIM}%**")
-    st.markdown(f"- Profit Factor &nbsp;&nbsp;&nbsp;&nbsp; **> {GOAL_PF_MIN}**")
+    if _sel_prof:
+        st.markdown(f"**🎯 {_sel_prof['profile_name']}**")
+        st.markdown(f"- Monthly Return ≥ **{_sel_prof['monthly_return_target']}%**")
+        st.markdown(f"- Daily DD ≤ **{_sel_prof['daily_drawdown_target']}%**")
+        st.markdown(f"- Monthly DD ≤ **{_sel_prof['monthly_drawdown_target']}%**")
+        st.markdown(f"- Profit Factor ≥ **{_sel_prof['profit_factor_target']}**")
+        st.caption("Manage profiles in **🎯 Goal Profiles** tab.")
+    else:
+        st.markdown("**🎯 Target Goals**")
+        st.caption("No goal profile loaded. Check backend connection.")
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -164,20 +248,35 @@ def _dataset_label(d: dict) -> str:
     )
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _fetch_datasets() -> list[dict]:
+    t0 = time.perf_counter()
     try:
         r = requests.get(f"{API}/api/v1/datasets", timeout=5)
-        return r.json().get("datasets", []) if r.status_code == 200 else []
+        result = r.json().get("datasets", []) if r.status_code == 200 else []
+        print(f"[perf] _fetch_datasets cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} datasets)", flush=True)
+        return result
     except Exception:
         return []
 
 
-def _fetch_research_runs(limit: int = 100) -> list[dict]:
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_research_runs(limit: int = 50) -> list[dict]:
+    t0 = time.perf_counter()
     try:
         r = requests.get(f"{API}/api/v1/research?limit={limit}", timeout=5)
-        return r.json().get("research_runs", []) if r.status_code == 200 else []
+        result = r.json().get("research_runs", []) if r.status_code == 200 else []
+        print(f"[perf] _fetch_research_runs cache-miss: {(time.perf_counter()-t0)*1000:.0f}ms  ({len(result)} runs)", flush=True)
+        return result
     except Exception:
         return []
+
+
+def _clear_data_cache() -> None:
+    """Invalidate cached fetch results after any mutation (upload/delete/reset/analysis)."""
+    _fetch_datasets.clear()
+    _fetch_research_runs.clear()
+    _fetch_goal_profiles.clear()
 
 
 def _parse_date(s: str | None) -> date | None:
@@ -196,6 +295,7 @@ neg_col = "#ef5350"
 # ── Results renderer (shared across Tab 1, Tab 3) ─────────────────────────────
 
 def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
+    fast_mode = st.session_state.get("perf_mode", False)
     rpt      = result.get("report", {})
     trades   = result.get("trades", [])
     params   = result.get("parameters", {})
@@ -203,6 +303,9 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
     bt_end   = result.get("backtest_end")
     sub_mode = result.get("analysis_sub_mode", "full_backtest")
     tfs_used = result.get("timeframes_used", [result.get("timeframe", "—")])
+
+    if fast_mode:
+        st.caption("⚡ Fast Mode — charts hidden. Disable in sidebar to view full charts.")
 
     if label:
         st.markdown(f"#### {label}")
@@ -240,6 +343,12 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
     )
     st.write("")
 
+    # Derive goal thresholds from stored report (works for both old and new format)
+    _goals_cfg     = rpt.get("goals", {})
+    _is_new_goals  = "monthly_return_target" in _goals_cfg
+    _mr_target     = _goals_cfg.get("monthly_return_target", GOAL_MR_MIN)
+    _dd_target     = _goals_cfg.get("daily_drawdown_target", GOAL_DD_LIM)
+
     # Key metrics row
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Trades",   rpt.get("total_trades", 0))
@@ -247,13 +356,15 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
     c3.metric("PF",       f"{rpt.get('profit_factor', 0):.2f}")
     c4.metric("Net R",    f"{rpt.get('net_r', 0):+.2f}R")
     _mr = rpt.get("monthly_return", 0)
+    _mr_ok = _mr >= _mr_target if _is_new_goals else GOAL_MR_MIN <= _mr <= GOAL_MR_MAX
     c5.metric("Monthly", f"{_mr:.2f}%",
-              delta="On target" if GOAL_MR_MIN <= _mr <= GOAL_MR_MAX else "Off target",
-              delta_color="normal" if GOAL_MR_MIN <= _mr <= GOAL_MR_MAX else "inverse")
+              delta="On target" if _mr_ok else "Off target",
+              delta_color="normal" if _mr_ok else "inverse")
     _dd = rpt.get("max_drawdown", 0)
+    _dd_ok = _dd <= _dd_target if _is_new_goals else _dd < GOAL_DD_LIM
     c6.metric("Max DD", f"{_dd:.2f}%",
-              delta="OK" if _dd < GOAL_DD_LIM else "Exceeded",
-              delta_color="normal" if _dd < GOAL_DD_LIM else "inverse")
+              delta="OK" if _dd_ok else "Exceeded",
+              delta_color="normal" if _dd_ok else "inverse")
     c7.metric("Open/Exp", rpt.get("open_trades", 0))
     st.write("")
 
@@ -263,87 +374,94 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
 
     # ── Equity Curve ──────────────────────────────────────────────────────────
     with teq:
-        equity = rpt.get("equity_curve", [0.0])
-        lc = pos_col if equity[-1] >= 0 else neg_col
-        fc = "rgba(38,166,154,0.10)" if equity[-1] >= 0 else "rgba(239,83,80,0.10)"
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=list(range(len(equity))), y=equity,
-            mode="lines", line=dict(color=lc, width=2),
-            fill="tozeroy", fillcolor=fc,
-        ))
-        fig.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
-        fig.update_layout(
-            title=f"Cumulative Return — {rpt.get('total_trades', 0)} closed trades",
-            xaxis_title="Trade #", yaxis_title="Return (%)",
-            template="plotly_dark", height=350,
-            margin=dict(l=10, r=10, t=45, b=10), showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        cd, ct = st.columns([1, 2])
-        with cd:
-            fig_p = go.Figure(go.Pie(
-                labels=["Win", "Loss", "Open"],
-                values=[rpt.get("win_trades", 0), rpt.get("loss_trades", 0), rpt.get("open_trades", 0)],
-                marker_colors=[pos_col, neg_col, "#ffa726"],
-                hole=0.45, textinfo="label+percent",
+        if fast_mode:
+            st.info("Chart hidden in Fast Mode. Disable ⚡ Fast Mode in sidebar to view.")
+        else:
+            equity = rpt.get("equity_curve", [0.0])
+            lc = pos_col if equity[-1] >= 0 else neg_col
+            fc = "rgba(38,166,154,0.10)" if equity[-1] >= 0 else "rgba(239,83,80,0.10)"
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(range(len(equity))), y=equity,
+                mode="lines", line=dict(color=lc, width=2),
+                fill="tozeroy", fillcolor=fc,
             ))
-            fig_p.update_layout(template="plotly_dark", height=240,
-                                margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
-            st.plotly_chart(fig_p, use_container_width=True)
-        with ct:
-            st.dataframe(pd.DataFrame([
-                ("Gross Profit R", f"+{rpt.get('gross_profit_r', 0):.2f}R"),
-                ("Gross Loss R",   f"-{rpt.get('gross_loss_r', 0):.2f}R"),
-                ("Net R",          f"{rpt.get('net_r', 0):+.2f}R"),
-                ("Net Return",     f"{rpt.get('net_r', 0) * risk_pct_val:.2f}%"),
-                ("Avg Monthly",    f"{rpt.get('monthly_return', 0):.2f}%"),
-                ("Max Drawdown",   f"{rpt.get('max_drawdown', 0):.2f}%"),
-                ("Profit Factor",  f"{rpt.get('profit_factor', 0):.2f}"),
-                ("Win Rate",       f"{rpt.get('win_rate', 0):.1f}%"),
-            ], columns=["Metric", "Value"]), use_container_width=True, hide_index=True)
+            fig.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
+            fig.update_layout(
+                title=f"Cumulative Return — {rpt.get('total_trades', 0)} closed trades",
+                xaxis_title="Trade #", yaxis_title="Return (%)",
+                template="plotly_dark", height=350,
+                margin=dict(l=10, r=10, t=45, b=10), showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            cd, ct = st.columns([1, 2])
+            with cd:
+                fig_p = go.Figure(go.Pie(
+                    labels=["Win", "Loss", "Open"],
+                    values=[rpt.get("win_trades", 0), rpt.get("loss_trades", 0), rpt.get("open_trades", 0)],
+                    marker_colors=[pos_col, neg_col, "#ffa726"],
+                    hole=0.45, textinfo="label+percent",
+                ))
+                fig_p.update_layout(template="plotly_dark", height=240,
+                                    margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
+                st.plotly_chart(fig_p, use_container_width=True)
+            with ct:
+                st.dataframe(pd.DataFrame([
+                    ("Gross Profit R", f"+{rpt.get('gross_profit_r', 0):.2f}R"),
+                    ("Gross Loss R",   f"-{rpt.get('gross_loss_r', 0):.2f}R"),
+                    ("Net R",          f"{rpt.get('net_r', 0):+.2f}R"),
+                    ("Net Return",     f"{rpt.get('net_r', 0) * risk_pct_val:.2f}%"),
+                    ("Avg Monthly",    f"{rpt.get('monthly_return', 0):.2f}%"),
+                    ("Max Drawdown",   f"{rpt.get('max_drawdown', 0):.2f}%"),
+                    ("Profit Factor",  f"{rpt.get('profit_factor', 0):.2f}"),
+                    ("Win Rate",       f"{rpt.get('win_rate', 0):.1f}%"),
+                ], columns=["Metric", "Value"]), use_container_width=True, hide_index=True)
 
     # ── Drawdown Curve ────────────────────────────────────────────────────────
     with tdd:
-        dd_curve = rpt.get("drawdown_curve", [])
-        if dd_curve:
-            fig_dd = go.Figure()
-            fig_dd.add_trace(go.Scatter(
-                x=list(range(len(dd_curve))),
-                y=[-v for v in dd_curve],
-                mode="lines",
-                line=dict(color=neg_col, width=1.5),
-                fill="tozeroy",
-                fillcolor="rgba(239,83,80,0.12)",
-            ))
-            fig_dd.add_hline(
-                y=-GOAL_DD_LIM,
-                line_color="rgba(255,167,38,0.7)",
-                line_dash="dash",
-                annotation_text=f"Limit {GOAL_DD_LIM}%",
-                annotation_position="top right",
-            )
-            fig_dd.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_dash="dot")
-            fig_dd.update_layout(
-                title=f"Drawdown Curve — Max {rpt.get('max_drawdown', 0):.2f}%",
-                xaxis_title="Trade #",
-                yaxis_title="Drawdown (%)",
-                template="plotly_dark",
-                height=380,
-                margin=dict(l=10, r=10, t=45, b=10),
-                showlegend=False,
-            )
-            st.plotly_chart(fig_dd, use_container_width=True)
-            _dd2 = rpt.get("max_drawdown", 0)
-            st.metric(
-                "Max Drawdown",
-                f"{_dd2:.2f}%",
-                delta="Within limit" if _dd2 < GOAL_DD_LIM else "Exceeded limit",
-                delta_color="normal" if _dd2 < GOAL_DD_LIM else "inverse",
-            )
+        _dd2    = rpt.get("max_drawdown", 0)
+        _dd_lim = _goals_cfg.get("daily_drawdown_target", GOAL_DD_LIM)
+        st.metric(
+            "Max Drawdown",
+            f"{_dd2:.2f}%",
+            delta="Within limit" if _dd2 <= _dd_lim else "Exceeded limit",
+            delta_color="normal" if _dd2 <= _dd_lim else "inverse",
+        )
+        if fast_mode:
+            st.info("Drawdown chart hidden in Fast Mode. Disable ⚡ Fast Mode in sidebar to view.")
         else:
-            st.info("Drawdown curve not available — run a new analysis to generate it.")
+            dd_curve = rpt.get("drawdown_curve", [])
+            if dd_curve:
+                fig_dd = go.Figure()
+                fig_dd.add_trace(go.Scatter(
+                    x=list(range(len(dd_curve))),
+                    y=[-v for v in dd_curve],
+                    mode="lines",
+                    line=dict(color=neg_col, width=1.5),
+                    fill="tozeroy",
+                    fillcolor="rgba(239,83,80,0.12)",
+                ))
+                fig_dd.add_hline(
+                    y=-_dd_lim,
+                    line_color="rgba(255,167,38,0.7)",
+                    line_dash="dash",
+                    annotation_text=f"Limit {_dd_lim}%",
+                    annotation_position="top right",
+                )
+                fig_dd.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_dash="dot")
+                fig_dd.update_layout(
+                    title=f"Drawdown Curve — Max {rpt.get('max_drawdown', 0):.2f}%",
+                    xaxis_title="Trade #",
+                    yaxis_title="Drawdown (%)",
+                    template="plotly_dark",
+                    height=380,
+                    margin=dict(l=10, r=10, t=45, b=10),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_dd, use_container_width=True)
+            else:
+                st.info("Drawdown curve not available — run a new analysis to generate it.")
 
     # ── Monthly Return ────────────────────────────────────────────────────────
     with tmo:
@@ -359,9 +477,16 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                 marker_color=[pos_col if v >= 0 else neg_col for v in retpct],
                 text=[f"{v:+.1f}%" for v in retpct], textposition="outside",
             ))
-            fig_mo.add_hrect(y0=GOAL_MR_MIN, y1=GOAL_MR_MAX,
-                             fillcolor="rgba(38,166,154,0.08)", line_width=0,
-                             annotation_text="Target 3–5%", annotation_position="top right")
+            _mr_tgt = _goals_cfg.get("monthly_return_target", GOAL_MR_MIN)
+            if _is_new_goals:
+                fig_mo.add_hline(y=_mr_tgt, line_color="rgba(38,166,154,0.7)",
+                                 line_dash="dash",
+                                 annotation_text=f"Target ≥{_mr_tgt}%",
+                                 annotation_position="top right")
+            else:
+                fig_mo.add_hrect(y0=GOAL_MR_MIN, y1=GOAL_MR_MAX,
+                                 fillcolor="rgba(38,166,154,0.08)", line_width=0,
+                                 annotation_text="Target 3–5%", annotation_position="top right")
             fig_mo.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
             fig_mo.update_layout(template="plotly_dark", height=350,
                                  margin=dict(l=10, r=10, t=45, b=10))
@@ -392,6 +517,8 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                 for yr, d2 in sorted(year_data.items()):
                     avg_mo = d2["return_pct"] / d2["months"] if d2["months"] > 0 else 0.0
                     wr2    = d2["wins"] / d2["trades"] * 100 if d2["trades"] > 0 else 0.0
+                    _yr_tgt = _goals_cfg.get("monthly_return_target", GOAL_MR_MIN)
+                    _yr_ok  = avg_mo >= _yr_tgt if _is_new_goals else GOAL_MR_MIN <= avg_mo <= GOAL_MR_MAX
                     year_rows.append({
                         "Year":    yr,
                         "Months":  d2["months"],
@@ -400,7 +527,7 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                         "Net R":   f"{d2['net_r']:+.2f}",
                         "Total %": f"{d2['return_pct']:+.2f}",
                         "Avg Mo%": f"{avg_mo:+.2f}",
-                        "Target":  "✅" if GOAL_MR_MIN <= avg_mo <= GOAL_MR_MAX else "❌",
+                        "Target":  "✅" if _yr_ok else "❌",
                     })
 
                 st.dataframe(pd.DataFrame(year_rows), use_container_width=True, hide_index=True)
@@ -413,9 +540,15 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
                     text=[f"{v:+.2f}%" for v in yr_vals],
                     textposition="outside",
                 ))
-                fig_yr.add_hrect(y0=GOAL_MR_MIN, y1=GOAL_MR_MAX,
-                                 fillcolor="rgba(38,166,154,0.08)", line_width=0,
-                                 annotation_text="Target 3–5%", annotation_position="top right")
+                if _is_new_goals:
+                    fig_yr.add_hline(y=_yr_tgt, line_color="rgba(38,166,154,0.7)",
+                                     line_dash="dash",
+                                     annotation_text=f"Target ≥{_yr_tgt}%",
+                                     annotation_position="top right")
+                else:
+                    fig_yr.add_hrect(y0=GOAL_MR_MIN, y1=GOAL_MR_MAX,
+                                     fillcolor="rgba(38,166,154,0.08)", line_width=0,
+                                     annotation_text="Target 3–5%", annotation_position="top right")
                 fig_yr.update_layout(
                     title="Average Monthly Return by Year",
                     xaxis_title="Year", yaxis_title="Avg Monthly %",
@@ -450,23 +583,63 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
     # ── Goals ─────────────────────────────────────────────────────────────────
     with tgo:
         gd  = rpt.get("goal_detail", {})
-        _IC = {"PASS": "✅", "WATCHLIST": "⚠️", "FAIL": "❌"}
+        _IC = {"PASS": "✅", "FAIL": "❌"}
         _GC = {"PASS": "goal-pass", "WATCHLIST": "goal-watch", "FAIL": "goal-fail"}
-        for gl, key, hint in [
-            ("Monthly Return", "monthly_return", "Avg monthly % gain over the backtest period."),
-            ("Max Drawdown",   "max_drawdown",   "Largest peak-to-trough equity decline."),
-            ("Profit Factor",  "profit_factor",  "Gross profit ÷ gross loss (in R)."),
-        ]:
-            g = gd.get(key, {})
-            s = g.get("status", "—")
+
+        # Show goal profile used
+        _gp_name = (
+            result.get("goal_profile_name")
+            or rpt.get("goal_profile_name")
+            or ("Legacy Goal Profile" if not _is_new_goals else None)
+        )
+        if _gp_name:
+            st.caption(f"**Goal Profile Used:** {_gp_name}")
+        st.write("")
+
+        # Overall status badge
+        _gs = rpt.get("goal_status", "INSUFFICIENT DATA")
+        _gs_bc = _STATUS_CLASS.get(_gs, "badge-insuf")
+        st.markdown(
+            f"**Overall Status:** &nbsp;<span class='badge {_gs_bc}'>{_gs}</span>",
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        # Per-metric display (handles both old 3-metric and new 4-metric formats)
+        if _is_new_goals:
+            _metrics = [
+                ("Monthly Return",   "monthly_return",   "Avg monthly % return over the backtest period."),
+                ("Daily Drawdown",   "daily_drawdown",   "Worst single-day equity loss (sum of trades closing that day)."),
+                ("Monthly Drawdown", "monthly_drawdown", "Worst single-month equity loss."),
+                ("Profit Factor",    "profit_factor",    "Gross profit ÷ gross loss (in R)."),
+            ]
+        else:
+            _metrics = [
+                ("Monthly Return", "monthly_return", "Avg monthly % gain over the backtest period."),
+                ("Max Drawdown",   "max_drawdown",   "Largest peak-to-trough equity decline."),
+                ("Profit Factor",  "profit_factor",  "Gross profit ÷ gross loss (in R)."),
+            ]
+
+        for gl, key, hint in _metrics:
+            g   = gd.get(key, {})
+            s   = g.get("status", "—")
+            val = g.get("value", "N/A")
+            tgt = g.get("target", "—")
+            ico = _IC.get(s, "⚠️")
+            val_str = f"{val}%" if key in ("monthly_return", "daily_drawdown", "monthly_drawdown", "max_drawdown") else str(val)
             st.markdown(
                 f'<div class="{_GC.get(s, "")}">'
-                f'{_IC.get(s, "❓")} &nbsp;<strong>{gl}</strong><br>'
-                f'&nbsp;&nbsp;&nbsp;Actual: <code>{g.get("value", "N/A")}</code>'
-                f' &nbsp; Target: <code>{g.get("target", "—")}</code>'
+                f'{ico} &nbsp;<strong>{gl}</strong>'
+                f'<br>&nbsp;&nbsp;&nbsp;{val_str} &nbsp;/&nbsp; Target: <code>{tgt}</code>'
                 f'<br>&nbsp;&nbsp;&nbsp;<em>{hint}</em></div><br>',
                 unsafe_allow_html=True,
             )
+
+        # PASS/WATCHLIST/FAIL legend
+        if _is_new_goals:
+            st.caption("PASS = all 4 targets met · WATCHLIST = 3/4 (75%+) · FAIL = fewer than 3/4")
+        else:
+            st.caption("PASS = all targets met · WATCHLIST = partial · FAIL = targets missed")
 
         st.divider()
         param_rows = [
@@ -498,13 +671,14 @@ def _render_results(result: dict, risk_pct_val: float, label: str = "") -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "▶ Run Analysis",
     "📂 Dataset Library",
     "🕒 Research History",
     "📤 Export Center",
     "🏥 Platform Health",
     "⚖️ Compare Modules",
+    "🎯 Goal Profiles",
 ])
 
 
@@ -660,6 +834,7 @@ with tab1:
 
                     st.session_state["_tf_datasets"]  = new_datasets
                     st.session_state["_upload_status"] = new_status
+                    _clear_data_cache()
                     st.rerun()
 
         elif not uploaded_files:
@@ -961,10 +1136,15 @@ with tab1:
         run_btn = st.button("▶  Run Analysis", type="primary", use_container_width=True)
     with col_desc:
         mode_label = "Single TF" if analysis_mode == "Single Timeframe" else "Multi-TF"
+        _mod_display = _module_label(module)
         st.caption(
-            f"**Liquidity Sweep** | **{mode_label}** | **{sub_mode_label}** | "
+            f"**{_mod_display}** | **{mode_label}** | **{sub_mode_label}** | "
             f"Risk: **{risk_pct}%** | RR: **{rr}R** | Swing N: **{lookback}**"
         )
+        st.caption(f"🔬 Current Selected Module: `{module}`")
+        if module not in _MODULE_LABELS:
+            print(f"[warn] Unknown module in session: {module!r}", flush=True)
+            st.warning(f"⚠️ Unknown module: {module!r} — not in registered module list.")
 
     if run_btn:
         errors: list[str] = []
@@ -1001,6 +1181,7 @@ with tab1:
                 "analysis_sub_mode": sub_mode_api,
                 "backtest_start":    start,
                 "backtest_end":      end,
+                "goal_profile_id":   goal_profile_id,
             }
             if analysis_mode == "Single Timeframe":
                 p["dataset_id"] = req_dataset_id
@@ -1054,6 +1235,7 @@ with tab1:
                 "is_pct": wf_is_pct,
             }
             st.session_state.pop("analysis", None)
+            _clear_data_cache()
             st.success(
                 f"Walk Forward complete — "
                 f"IS: **{is_result.get('research_id','')[:8]}** | "
@@ -1063,19 +1245,23 @@ with tab1:
         else:
             # ── Single API call ─────────────────────────────────────────────
             payload = _make_payload("", bt_start_str, bt_end_str)
+            _t_run = time.perf_counter()
             with st.spinner("Running backtest — detecting swings, executing trades…"):
                 try:
                     resp = requests.post(f"{API}/api/v1/analyze", json=payload, timeout=120)
                 except requests.exceptions.ConnectionError:
                     st.error("Lost connection to backend.")
                     st.stop()
+            print(f"[perf] /analyze request: {(time.perf_counter()-_t_run)*1000:.0f}ms", flush=True)
 
             if resp.status_code == 200:
-                st.session_state["analysis"] = resp.json()
+                _result = resp.json()
+                st.session_state["analysis"] = _result
                 st.session_state.pop("analysis_wf", None)
+                _clear_data_cache()
                 st.success(
                     f"Analysis complete — "
-                    f"Research ID: **{resp.json().get('research_id','')[:8]}**"
+                    f"Research ID: **{_result.get('research_id','')[:8]}**"
                 )
             else:
                 try:
@@ -1218,6 +1404,7 @@ with tab2:
                 if dr.status_code == 200:
                     st.success("Dataset deleted.")
                     st.session_state.pop("_confirm_delete_dataset", None)
+                    _clear_data_cache()
                     st.rerun()
                 else:
                     st.error("Delete failed.")
@@ -1230,7 +1417,17 @@ with tab3:
     st.subheader("🕒 Research History")
     st.caption("All completed analysis runs, stored persistently in SQLite.")
 
-    runs = _fetch_research_runs()
+    _hist_col1, _hist_col2 = st.columns([3, 1])
+    with _hist_col2:
+        hist_limit = st.selectbox(
+            "Show last N runs", [25, 50, 100, 200], index=1, key="hist_limit"
+        )
+    with _hist_col1:
+        if st.button("🔄 Refresh History", key="hist_refresh"):
+            _clear_data_cache()
+            st.rerun()
+
+    runs = _fetch_research_runs(limit=hist_limit)
 
     if not runs:
         st.info("No research runs yet. Run an analysis in **Run Analysis** to create records.")
@@ -1239,24 +1436,25 @@ with tab3:
         for r in runs:
             tfs = json.loads(r.get("timeframes_used", "[]"))
             summary_rows.append({
-                "Name":       r.get("research_name", "—"),
-                "Date":       r["created_datetime"][:16].replace("T", " "),
-                "Mode":       r["timeframe_mode"],
-                "TF(s)":      ", ".join(tfs),
-                "Analysis":   _SUB_MODE_LABELS.get(r.get("analysis_sub_mode", ""), "—"),
-                "Range":      (
+                "Name":            r.get("research_name", "—"),
+                "Date/Time (MYT)": _to_myt(r.get("created_datetime")),
+                "Module":          _module_label(r.get("selected_module")),
+                "Mode":            r["timeframe_mode"],
+                "TF(s)":           ", ".join(tfs),
+                "Analysis":        _SUB_MODE_LABELS.get(r.get("analysis_sub_mode", ""), "—"),
+                "Range":           (
                     f"{r['backtest_start'][:10] if r.get('backtest_start') else '—'}"
                     f" → "
                     f"{r['backtest_end'][:10] if r.get('backtest_end') else '—'}"
                 ),
-                "Trades":     r["total_trades"],
-                "Win%":       f"{r['win_rate']:.1f}",
-                "PF":         f"{r['profit_factor']:.2f}",
-                "Net R":      f"{r['net_r']:+.2f}",
-                "Monthly%":   f"{r['monthly_return']:.2f}",
-                "DD%":        f"{r['max_drawdown']:.2f}",
-                "Status":     r["goal_status"],
-                "_id":        r["research_id"],
+                "Trades":          r["total_trades"],
+                "Win%":            f"{r['win_rate']:.1f}",
+                "PF":              f"{r['profit_factor']:.2f}",
+                "Net R":           f"{r['net_r']:+.2f}",
+                "Monthly%":        f"{r['monthly_return']:.2f}",
+                "DD%":             f"{r['max_drawdown']:.2f}",
+                "Status":          r["goal_status"],
+                "_id":             r["research_id"],
             })
 
         sum_df = pd.DataFrame(summary_rows)
@@ -1270,7 +1468,8 @@ with tab3:
             range(len(runs)),
             format_func=lambda i: (
                 f"{runs[i].get('research_name','—')} "
-                f"[{runs[i]['created_datetime'][:10]}] "
+                f"[{_to_myt(runs[i].get('created_datetime'))}] "
+                f"{_module_label(runs[i].get('selected_module'))} "
                 f"— {runs[i]['total_trades']} trades, {runs[i]['goal_status']}"
             ),
             key="hist_sel_idx",
@@ -1311,6 +1510,7 @@ with tab3:
                 if dr2.status_code == 200:
                     st.success("Research run deleted.")
                     st.session_state.pop("_confirm_delete_run", None)
+                    _clear_data_cache()
                     st.rerun()
                 else:
                     st.error("Delete failed.")
@@ -1328,6 +1528,14 @@ with tab3:
                         run_detail = detail_resp.json()
                         full_rpt   = json.loads(run_detail.get("full_report") or "{}")
                         if full_rpt:
+                            dm1, dm2 = st.columns(2)
+                            dm1.markdown(
+                                f"**Module Used:** {_module_label(run_detail.get('selected_module'))}"
+                            )
+                            dm2.markdown(
+                                f"**Created (MYT):** {_to_myt(run_detail.get('created_datetime'))}"
+                            )
+                            st.write("")
                             fake_result = {
                                 "report":           full_rpt,
                                 "trades":           [],
@@ -1477,7 +1685,8 @@ with tab4:
             range(len(exp_runs)),
             format_func=lambda i: (
                 f"{exp_runs[i].get('research_name','—')} "
-                f"[{exp_runs[i]['created_datetime'][:10]}] "
+                f"[{_to_myt(exp_runs[i].get('created_datetime'))}] "
+                f"{_module_label(exp_runs[i].get('selected_module'))} "
                 f"— {exp_runs[i]['total_trades']} trades"
             ),
             key="exp_run_idx",
@@ -1486,7 +1695,8 @@ with tab4:
         exp_rid = exp_run["research_id"]
         st.markdown(
             f"**{exp_run.get('research_name','—')}** · "
-            f"{exp_run['created_datetime'][:16].replace('T',' ')} · "
+            f"{_to_myt(exp_run.get('created_datetime'))} · "
+            f"**{_module_label(exp_run.get('selected_module'))}** · "
             f"{exp_run['total_trades']} trades · **{exp_run['goal_status']}**"
         )
         if exp_run.get("backtest_start") or exp_run.get("backtest_end"):
@@ -1587,10 +1797,23 @@ with tab5:
         lc1, lc2, lc3, lc4 = st.columns(4)
         lc1.markdown(f"**ID:** `{latest.get('research_id','—')[:8]}…`")
         lc2.markdown(f"**Name:** {latest.get('research_name','—')}")
-        lc3.markdown(f"**Created:** {str(latest.get('created_datetime','—'))[:16]}")
+        lc3.markdown(f"**Created (MYT):** {_to_myt(latest.get('created_datetime'))}")
         lc4.markdown(f"**Status:** {latest.get('goal_status','—')}")
     else:
         st.info("No research runs recorded yet.")
+
+    # ── Default Goal Profile ──────────────────────────────────────────────────
+    st.markdown("### 🎯 Current Default Goal Profile")
+    dgp = h.get("default_goal_profile")
+    if dgp:
+        gc1, gc2, gc3, gc4, gc5 = st.columns(5)
+        gc1.metric("Profile", dgp.get("profile_name", "—"))
+        gc2.metric("Monthly Return", f"≥ {dgp.get('monthly_return_target', '—')}%")
+        gc3.metric("Daily DD",       f"≤ {dgp.get('daily_drawdown_target', '—')}%")
+        gc4.metric("Monthly DD",     f"≤ {dgp.get('monthly_drawdown_target', '—')}%")
+        gc5.metric("Profit Factor",  f"≥ {dgp.get('profit_factor_target', '—')}")
+    else:
+        st.info("No default goal profile found. Go to **🎯 Goal Profiles** tab to set one.")
 
     # ── Export Folder ─────────────────────────────────────────────────────────
     st.markdown("### 📁 Export Folder")
@@ -1623,6 +1846,7 @@ with tab5:
         ("research_runs table present",  tables.get("research_runs") is not None),
         ("trade_logs table present",     tables.get("trade_logs") is not None),
         ("monthly_reports table present",tables.get("monthly_reports") is not None),
+        ("Default goal profile set",     h.get("default_goal_profile") is not None),
         ("At least 1 dataset stored",    (tables.get("datasets") or 0) >= 1),
         ("At least 1 research run saved",(tables.get("research_runs") or 0) >= 1),
         ("Export folder exists",         export_dir.exists()),
@@ -1666,6 +1890,7 @@ with tab5:
             )
             if rr.status_code == 200:
                 st.success("✅ Database reset complete. All tables recreated.")
+                _clear_data_cache()
                 for k in list(st.session_state.keys()):
                     st.session_state.pop(k, None)
                 st.rerun()
@@ -1838,6 +2063,7 @@ with tab6:
             "backtest_start":   cmp_bt_start,
             "backtest_end":     cmp_bt_end,
             "analysis_sub_mode": "full_backtest",
+            "goal_profile_id":  goal_profile_id,
         }
         if cmp_tf_mode == "Single Timeframe":
             cmp_payload["dataset_id"] = cmp_dataset_id
@@ -1847,15 +2073,18 @@ with tab6:
             cmp_payload["trend_tf"]     = cmp_trend_tf
             cmp_payload["entry_tf"]     = cmp_entry_tf
 
+        _t_cmp = time.perf_counter()
         with st.spinner("Running comparison — both modules on the same dataset…"):
             try:
                 cmp_resp = requests.post(f"{API}/api/v1/compare", json=cmp_payload, timeout=180)
             except requests.exceptions.ConnectionError:
                 st.error("Lost connection to backend.")
                 st.stop()
+        print(f"[perf] /compare request: {(time.perf_counter()-_t_cmp)*1000:.0f}ms", flush=True)
 
         if cmp_resp.status_code == 200:
             st.session_state["cmp_result"] = cmp_resp.json()
+            _clear_data_cache()
             st.success("Comparison complete!")
         else:
             try:
@@ -1915,3 +2144,226 @@ with tab6:
         for mod_id, mod_result in cmp_data.get("results", {}).items():
             with st.expander(f"📈 {_MOD_LABEL.get(mod_id, mod_id)} — full results", expanded=False):
                 _render_results(mod_result, cmp_risk_pct, label=_MOD_LABEL.get(mod_id, mod_id))
+
+
+# ═════════════════════════ TAB 7 — GOAL PROFILES ══════════════════════════════
+with tab7:
+    st.subheader("🎯 Goal Configuration")
+    st.caption(
+        "Create and manage goal profiles. Each profile defines the 4 evaluation thresholds used "
+        "when running analysis. Select a profile in the sidebar to apply it to your next run."
+    )
+
+    gp_all = _fetch_goal_profiles()
+
+    # ── Current Profiles Table ────────────────────────────────────────────────
+    st.markdown("### Current Profiles")
+    if gp_all:
+        gp_rows = []
+        for p in gp_all:
+            gp_rows.append({
+                "Default":          "⭐ Yes" if p.get("is_default") else "—",
+                "Profile Name":     p["profile_name"],
+                "Monthly Return ≥": f"{p['monthly_return_target']}%",
+                "Daily DD ≤":       f"{p['daily_drawdown_target']}%",
+                "Monthly DD ≤":     f"{p['monthly_drawdown_target']}%",
+                "Profit Factor ≥":  f"{p['profit_factor_target']}",
+                "_id":              p["id"],
+            })
+        gp_df = pd.DataFrame(gp_rows)
+        st.dataframe(gp_df.drop(columns=["_id"]), use_container_width=True, hide_index=True)
+        st.caption(f"{len(gp_all)} profile(s) · PASS = all 4 met · WATCHLIST = 3/4 · FAIL = <3/4")
+    else:
+        st.warning("No profiles found — backend may be offline or database not yet initialised.")
+
+    st.divider()
+
+    # ── Profile Actions ───────────────────────────────────────────────────────
+    st.markdown("### Manage Profiles")
+
+    if gp_all:
+        gp_sel_idx = st.selectbox(
+            "Select profile to manage",
+            range(len(gp_all)),
+            format_func=lambda i: (
+                f"{'⭐ ' if gp_all[i].get('is_default') else ''}{gp_all[i]['profile_name']}"
+            ),
+            key="gp_manage_sel",
+        )
+        gp_sel = gp_all[gp_sel_idx]
+        gp_sel_id = gp_sel["id"]
+
+        gpa_col, gpb_col, gpc_col = st.columns(3)
+
+        # ── Set as Default ────────────────────────────────────────────────────
+        with gpa_col:
+            if gp_sel.get("is_default"):
+                st.button("⭐ Already Default", disabled=True, key="gp_set_default_btn")
+            elif st.button("⭐ Set as Default", key="gp_set_default_btn", type="secondary"):
+                try:
+                    r = requests.post(
+                        f"{API}/api/v1/goals/profiles/{gp_sel_id}/set-default", timeout=10
+                    )
+                    if r.status_code == 200:
+                        st.success(f"'{gp_sel['profile_name']}' is now the default profile.")
+                        _clear_data_cache()
+                        st.rerun()
+                    else:
+                        st.error(f"Failed: {r.text}")
+                except Exception as exc:
+                    st.error(f"Connection error: {exc}")
+
+        # ── Delete ────────────────────────────────────────────────────────────
+        with gpb_col:
+            if gp_sel.get("is_default"):
+                st.button("🗑️ Delete", disabled=True, key="gp_delete_btn",
+                          help="Cannot delete the default profile. Set another as default first.")
+            elif st.button("🗑️ Delete", key="gp_delete_btn", type="secondary"):
+                st.session_state["_confirm_delete_gp"] = gp_sel_id
+
+        if st.session_state.get("_confirm_delete_gp") == gp_sel_id:
+            st.warning(f"Delete profile **{gp_sel['profile_name']}**? This cannot be undone.")
+            dgc1, dgc2 = st.columns(2)
+            if dgc1.button("✅ Yes, delete", type="primary", key="gp_del_confirm"):
+                try:
+                    dr = requests.delete(
+                        f"{API}/api/v1/goals/profiles/{gp_sel_id}", timeout=10
+                    )
+                    if dr.status_code == 200:
+                        st.success("Profile deleted.")
+                        st.session_state.pop("_confirm_delete_gp", None)
+                        _clear_data_cache()
+                        st.rerun()
+                    else:
+                        try:
+                            err = dr.json().get("detail", dr.text)
+                        except Exception:
+                            err = dr.text
+                        st.error(f"Delete failed: {err}")
+                except Exception as exc:
+                    st.error(f"Connection error: {exc}")
+            if dgc2.button("✗ Cancel", key="gp_del_cancel"):
+                st.session_state.pop("_confirm_delete_gp", None)
+
+        # ── Edit ─────────────────────────────────────────────────────────────
+        with st.expander(f"✏️ Edit — {gp_sel['profile_name']}", expanded=False):
+            with st.form(f"edit_gp_{gp_sel_id}", border=False):
+                ep_name = st.text_input("Profile Name", value=gp_sel["profile_name"])
+                ep1, ep2 = st.columns(2)
+                ep_mr  = ep1.number_input("Monthly Return ≥ (%)",
+                                          min_value=0.1, max_value=100.0,
+                                          value=float(gp_sel["monthly_return_target"]), step=0.5,
+                                          key=f"ep_mr_{gp_sel_id}")
+                ep_ddd = ep2.number_input("Daily Drawdown ≤ (%)",
+                                          min_value=0.1, max_value=100.0,
+                                          value=float(gp_sel["daily_drawdown_target"]), step=0.5,
+                                          key=f"ep_ddd_{gp_sel_id}")
+                ep3, ep4 = st.columns(2)
+                ep_mdd = ep3.number_input("Monthly Drawdown ≤ (%)",
+                                          min_value=0.1, max_value=100.0,
+                                          value=float(gp_sel["monthly_drawdown_target"]), step=0.5,
+                                          key=f"ep_mdd_{gp_sel_id}")
+                ep_pf  = ep4.number_input("Profit Factor ≥",
+                                          min_value=0.1, max_value=100.0,
+                                          value=float(gp_sel["profit_factor_target"]), step=0.1,
+                                          key=f"ep_pf_{gp_sel_id}")
+                if st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True):
+                    if not ep_name.strip():
+                        st.error("Profile name cannot be empty.")
+                    else:
+                        try:
+                            ur = requests.put(
+                                f"{API}/api/v1/goals/profiles/{gp_sel_id}",
+                                json={
+                                    "profile_name":            ep_name.strip(),
+                                    "monthly_return_target":   ep_mr,
+                                    "daily_drawdown_target":   ep_ddd,
+                                    "monthly_drawdown_target": ep_mdd,
+                                    "profit_factor_target":    ep_pf,
+                                },
+                                timeout=10,
+                            )
+                            if ur.status_code == 200:
+                                st.success("Profile updated.")
+                                _clear_data_cache()
+                                st.rerun()
+                            else:
+                                st.error(f"Update failed: {ur.text}")
+                        except Exception as exc:
+                            st.error(f"Connection error: {exc}")
+
+    # ── Create New Profile ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Create New Profile")
+    st.caption(
+        "Examples: **Conservative** (low DD, modest return) · "
+        "**Aggressive** (high return target) · "
+        "**Prop Firm** (strict daily DD < 2%) · "
+        "**Personal Account** (custom thresholds)"
+    )
+
+    with st.form("create_goal_profile", border=True):
+        np_name = st.text_input(
+            "Profile Name",
+            placeholder="e.g. Prop Firm, Personal Account, Conservative…",
+        )
+        cp1, cp2 = st.columns(2)
+        np_mr  = cp1.number_input("Monthly Return ≥ (%)",  min_value=0.1, max_value=100.0, value=5.0,  step=0.5)
+        np_ddd = cp2.number_input("Daily Drawdown ≤ (%)",  min_value=0.1, max_value=100.0, value=4.0,  step=0.5)
+        cp3, cp4 = st.columns(2)
+        np_mdd = cp3.number_input("Monthly Drawdown ≤ (%)", min_value=0.1, max_value=100.0, value=12.0, step=0.5)
+        np_pf  = cp4.number_input("Profit Factor ≥",        min_value=0.1, max_value=100.0, value=1.5,  step=0.1)
+        np_default = st.checkbox("Set as default profile")
+
+        if st.form_submit_button("➕ Create Profile", type="primary", use_container_width=True):
+            if not np_name.strip():
+                st.error("Profile name cannot be empty.")
+            else:
+                try:
+                    cr = requests.post(
+                        f"{API}/api/v1/goals/profiles",
+                        json={
+                            "profile_name":            np_name.strip(),
+                            "monthly_return_target":   np_mr,
+                            "daily_drawdown_target":   np_ddd,
+                            "monthly_drawdown_target": np_mdd,
+                            "profit_factor_target":    np_pf,
+                            "is_default":              np_default,
+                        },
+                        timeout=10,
+                    )
+                    if cr.status_code == 200:
+                        st.success(f"Profile '{np_name.strip()}' created.")
+                        _clear_data_cache()
+                        st.rerun()
+                    else:
+                        try:
+                            err = cr.json().get("detail", cr.text)
+                        except Exception:
+                            err = cr.text
+                        st.error(f"Create failed: {err}")
+                except Exception as exc:
+                    st.error(f"Connection error: {exc}")
+
+    # ── How PASS/WATCHLIST/FAIL Works ─────────────────────────────────────────
+    st.divider()
+    st.markdown("### How PASS / WATCHLIST / FAIL Works")
+    st.markdown("""
+Each analysis run is evaluated against the 4 metrics in the active goal profile:
+
+| Metric | Direction | Notes |
+|---|---|---|
+| Monthly Return | Actual ≥ Target | Average monthly % gain over the backtest |
+| Daily Drawdown | Actual ≤ Target | Worst single-day equity loss |
+| Monthly Drawdown | Actual ≤ Target | Worst single-month equity loss |
+| Profit Factor | Actual ≥ Target | Gross profit ÷ gross loss (in R) |
+
+**Composite Status:**
+- **PASS** — All 4 metrics meet their targets
+- **WATCHLIST** — 3 of 4 metrics pass (75 %)
+- **FAIL** — Fewer than 3 of 4 metrics pass (< 75 %)
+""")
+    st.info(
+        "Old research runs (before Goal Profiles were added) used the legacy 3-metric evaluation "
+        "and are stored as **Legacy Goal Profile** in the research history."
+    )

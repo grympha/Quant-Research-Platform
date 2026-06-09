@@ -76,6 +76,14 @@ from database.db import (
     save_research_run_complete,
     save_trade_logs,
     save_upload,
+    # Goal profile CRUD
+    list_goal_profiles,
+    get_goal_profile,
+    get_default_goal_profile,
+    create_goal_profile,
+    update_goal_profile,
+    delete_goal_profile,
+    set_default_goal_profile,
 )
 
 UPLOAD_DIR = Path("data/uploads")
@@ -132,6 +140,15 @@ app.add_middleware(
 
 # ── Request schemas ───────────────────────────────────────────────────────────
 
+class GoalProfileRequest(BaseModel):
+    profile_name:            str
+    monthly_return_target:   float = Field(ge=0.1, le=100.0)
+    daily_drawdown_target:   float = Field(ge=0.1, le=100.0)
+    monthly_drawdown_target: float = Field(ge=0.1, le=100.0)
+    profit_factor_target:    float = Field(ge=0.1, le=100.0)
+    is_default:              bool  = False
+
+
 class AnalyzeRequest(BaseModel):
     # ── Stored dataset sources ─────────────────────────────────────────────────
     dataset_id:  Optional[str]            = None
@@ -164,6 +181,9 @@ class AnalyzeRequest(BaseModel):
     backtest_start:    Optional[str] = None
     backtest_end:      Optional[str] = None
     analysis_sub_mode: str           = "full_backtest"
+
+    # ── Goal profile ───────────────────────────────────────────────────────────
+    goal_profile_id: Optional[str] = None   # if None, backend loads the default profile
 
 
 class CompareRequest(AnalyzeRequest):
@@ -207,6 +227,83 @@ def admin_reset_db(confirm: str = ""):
 @app.get("/api/v1/modules", tags=["Modules"])
 def list_modules():
     return {"modules": MODULES}
+
+
+# ── Goal Profiles ─────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/goals/profiles", tags=["Goal Profiles"])
+def get_goal_profiles_list():
+    """List all goal profiles, ordered by default-first then name."""
+    return {"profiles": list_goal_profiles()}
+
+
+@app.get("/api/v1/goals/profiles/default", tags=["Goal Profiles"])
+def get_goal_profile_default():
+    """Return the current default goal profile."""
+    p = get_default_goal_profile()
+    if not p:
+        raise HTTPException(404, "No default goal profile found.")
+    return p
+
+
+@app.post("/api/v1/goals/profiles", tags=["Goal Profiles"])
+def create_goal_profile_endpoint(req: GoalProfileRequest):
+    """Create a new custom goal profile."""
+    try:
+        pid = create_goal_profile(
+            profile_name            = req.profile_name,
+            monthly_return_target   = req.monthly_return_target,
+            daily_drawdown_target   = req.daily_drawdown_target,
+            monthly_drawdown_target = req.monthly_drawdown_target,
+            profit_factor_target    = req.profit_factor_target,
+            is_default              = req.is_default,
+        )
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+    return {"profile_id": pid, "message": f"Profile '{req.profile_name}' created."}
+
+
+@app.get("/api/v1/goals/profiles/{profile_id}", tags=["Goal Profiles"])
+def get_goal_profile_detail(profile_id: str):
+    """Return a single goal profile by ID."""
+    p = get_goal_profile(profile_id)
+    if not p:
+        raise HTTPException(404, "Goal profile not found.")
+    return p
+
+
+@app.put("/api/v1/goals/profiles/{profile_id}", tags=["Goal Profiles"])
+def update_goal_profile_endpoint(profile_id: str, req: GoalProfileRequest):
+    """Update an existing goal profile's name and thresholds."""
+    if not update_goal_profile(
+        profile_id,
+        profile_name            = req.profile_name,
+        monthly_return_target   = req.monthly_return_target,
+        daily_drawdown_target   = req.daily_drawdown_target,
+        monthly_drawdown_target = req.monthly_drawdown_target,
+        profit_factor_target    = req.profit_factor_target,
+    ):
+        raise HTTPException(404, "Goal profile not found.")
+    return {"updated": profile_id}
+
+
+@app.delete("/api/v1/goals/profiles/{profile_id}", tags=["Goal Profiles"])
+def delete_goal_profile_endpoint(profile_id: str):
+    """Delete a goal profile. Cannot delete the default profile."""
+    try:
+        if not delete_goal_profile(profile_id):
+            raise HTTPException(404, "Goal profile not found.")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"deleted": profile_id}
+
+
+@app.post("/api/v1/goals/profiles/{profile_id}/set-default", tags=["Goal Profiles"])
+def set_goal_profile_default(profile_id: str):
+    """Set a goal profile as the new default."""
+    if not set_default_goal_profile(profile_id):
+        raise HTTPException(404, "Goal profile not found.")
+    return {"default": profile_id}
 
 
 # ── Dataset Library ───────────────────────────────────────────────────────────
@@ -567,31 +664,57 @@ def _run_analysis(req: AnalyzeRequest) -> dict:
 
     trades = _dispatch_module(req.module, primary_df, req, data_by_timeframe)
 
+    # ── Load goal profile ─────────────────────────────────────────────────────
+    goal_profile = None
+    if req.goal_profile_id:
+        goal_profile = get_goal_profile(req.goal_profile_id)
+    if not goal_profile:
+        goal_profile = get_default_goal_profile()
+
+    goals_for_report = None
+    if goal_profile:
+        goals_for_report = {
+            "monthly_return_target":   goal_profile["monthly_return_target"],
+            "daily_drawdown_target":   goal_profile["daily_drawdown_target"],
+            "monthly_drawdown_target": goal_profile["monthly_drawdown_target"],
+            "profit_factor_target":    goal_profile["profit_factor_target"],
+            "_profile_id":             goal_profile["id"],
+            "_profile_name":           goal_profile["profile_name"],
+        }
+
     rpt = _sanitise_report(report_gen.generate(
         trades,
         req.risk_pct,
         start_date=str(primary_df.index[0]),
         end_date=str(primary_df.index[-1]),
+        goals=goals_for_report,
     ))
 
     clean_trades = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
 
+    _gp_values_snapshot = json.dumps({
+        k: v for k, v in (goals_for_report or {}).items() if not k.startswith("_")
+    }) if goals_for_report else None
+
     research_id = save_research_run_complete(
-        research_name     = req.research_name,
-        selected_module   = req.module,
-        symbol            = "XAUUSD",
-        timeframe_mode    = req.analysis_mode,
-        timeframes_used   = list(data_by_timeframe.keys()),
-        dataset_ids_used  = dataset_ids_used,
-        risk_percent      = req.risk_pct,
-        reward_risk_ratio = req.rr,
-        lookback          = req.lookback,
-        report            = rpt,
-        trades            = clean_trades,
-        monthly_breakdown = rpt.get("monthly_breakdown", []),
-        backtest_start    = req.backtest_start,
-        backtest_end      = req.backtest_end,
-        analysis_sub_mode = req.analysis_sub_mode,
+        research_name        = req.research_name,
+        selected_module      = req.module,
+        symbol               = "XAUUSD",
+        timeframe_mode       = req.analysis_mode,
+        timeframes_used      = list(data_by_timeframe.keys()),
+        dataset_ids_used     = dataset_ids_used,
+        risk_percent         = req.risk_pct,
+        reward_risk_ratio    = req.rr,
+        lookback             = req.lookback,
+        report               = rpt,
+        trades               = clean_trades,
+        monthly_breakdown    = rpt.get("monthly_breakdown", []),
+        backtest_start       = req.backtest_start,
+        backtest_end         = req.backtest_end,
+        analysis_sub_mode    = req.analysis_sub_mode,
+        goal_profile_id      = goal_profile["id"]           if goal_profile else None,
+        goal_profile_name    = goal_profile["profile_name"] if goal_profile else None,
+        goal_values_snapshot = _gp_values_snapshot,
     )
     print(f"[analyze] research_id={research_id}  trades={len(clean_trades)}", flush=True)
 
@@ -623,6 +746,8 @@ def _run_analysis(req: AnalyzeRequest) -> dict:
         "structure_tf":      req.structure_tf,
         "entry_tf":          req.entry_tf,
         "trend_tf":          req.trend_tf,
+        "goal_profile_id":   goal_profile["id"]           if goal_profile else None,
+        "goal_profile_name": goal_profile["profile_name"] if goal_profile else None,
         "parameters":        {
             "risk_pct": req.risk_pct,
             "rr":       req.rr,
@@ -791,10 +916,25 @@ def export_research(research_id: str, fmt: str):
         )
 
     if fmt == "summary":
+        from datetime import timezone as _tz, timedelta as _td
+        _MYT = _tz(_td(hours=8))
+        try:
+            _ts = pd.Timestamp(run["created_datetime"])
+            if _ts.tzinfo is None:
+                _ts = _ts.tz_localize("UTC")
+            created_myt = _ts.tz_convert(_MYT).strftime("%d-%m-%Y %H:%M") + " MYT"
+        except Exception:
+            created_myt = run["created_datetime"]
+
         meta = {
-            "research_id": research_id,
-            "module":      run["selected_module"],
-            "timeframe":   run["timeframe_mode"],
+            "research_id":          research_id,
+            "module":               run["selected_module"],
+            "module_name":          _MODULE_DISPLAY.get(run["selected_module"], run["selected_module"]),
+            "timeframe":            run["timeframe_mode"],
+            "created_datetime_utc": run["created_datetime"],
+            "created_datetime_myt": created_myt,
+            "goal_profile_name":    run.get("goal_profile_name") or "Legacy Goal Profile",
+            "goal_values":          run.get("goal_values_snapshot") or "{}",
         }
         data = export.build_summary_csv(report_dict, meta)
         return Response(
@@ -803,22 +943,37 @@ def export_research(research_id: str, fmt: str):
         )
 
     if fmt == "report":
+        from datetime import timezone as _tz, timedelta as _td
+        _MYT = _tz(_td(hours=8))
+        try:
+            _ts = pd.Timestamp(run["created_datetime"])
+            if _ts.tzinfo is None:
+                _ts = _ts.tz_localize("UTC")
+            created_myt = _ts.tz_convert(_MYT).strftime("%d-%m-%Y %H:%M") + " MYT"
+        except Exception:
+            created_myt = run["created_datetime"]
+
         result_full = {
-            "research_id":    research_id,
-            "research_name":  run.get("research_name"),
-            "created":        run["created_datetime"],
-            "module":         run["selected_module"],
-            "symbol":         run["symbol"],
-            "timeframe_mode": run["timeframe_mode"],
-            "timeframes":     json.loads(run["timeframes_used"]),
+            "research_id":          research_id,
+            "research_name":        run.get("research_name"),
+            "created":              run["created_datetime"],
+            "created_datetime_myt": created_myt,
+            "module":               run["selected_module"],
+            "module_name":          _MODULE_DISPLAY.get(run["selected_module"], run["selected_module"]),
+            "symbol":               run["symbol"],
+            "timeframe_mode":       run["timeframe_mode"],
+            "timeframes":           json.loads(run["timeframes_used"]),
+            "goal_profile_name":    run.get("goal_profile_name") or "Legacy Goal Profile",
+            "goal_values":          json.loads(run["goal_values_snapshot"])
+                                    if run.get("goal_values_snapshot") else {},
             "parameters": {
                 "risk_pct": run["risk_percent"],
                 "rr":       run["reward_risk_ratio"],
                 "lookback": run["lookback"],
             },
-            "report": report_dict,
-            "trades": get_trade_logs(research_id),
-            "monthly": get_monthly_reports(research_id),
+            "report":   report_dict,
+            "trades":   get_trade_logs(research_id),
+            "monthly":  get_monthly_reports(research_id),
         }
         data = export.build_report_json(result_full)
         return Response(

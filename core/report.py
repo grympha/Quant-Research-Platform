@@ -25,6 +25,7 @@ import pandas as pd
 
 # ── Goal definitions ──────────────────────────────────────────────────────────
 
+# Legacy constant — kept so stored full_report JSON from old runs still renders.
 GOALS: dict[str, Any] = {
     "monthly_return_min": 3.0,
     "monthly_return_max": 5.0,
@@ -32,10 +33,13 @@ GOALS: dict[str, Any] = {
     "profit_factor_min":  1.5,
 }
 
-_WATCHLIST_MONTHLY_LO  = 1.5   # %
-_WATCHLIST_MONTHLY_HI  = 8.0   # % (above target but suspicious)
-_WATCHLIST_DD          = 6.0   # %
-_WATCHLIST_PF          = 1.2
+# Default profile thresholds used when no goal profile is passed to generate().
+DEFAULT_GOALS: dict[str, Any] = {
+    "monthly_return_target":   5.0,   # actual >= target → PASS
+    "daily_drawdown_target":   4.0,   # actual <= target → PASS
+    "monthly_drawdown_target": 12.0,  # actual <= target → PASS
+    "profit_factor_target":    1.5,   # actual >= target → PASS
+}
 
 _EMPTY_REPORT: dict[str, Any] = {
     "total_trades":      0,
@@ -49,9 +53,11 @@ _EMPTY_REPORT: dict[str, Any] = {
     "net_r":             0.0,
     "monthly_return":    0.0,
     "max_drawdown":      0.0,
+    "daily_drawdown":    0.0,
+    "monthly_drawdown":  0.0,
     "goal_status":       "INSUFFICIENT DATA",
     "goal_detail":       {},
-    "goals":             GOALS,
+    "goals":             DEFAULT_GOALS,
     "equity_curve":      [0.0],
     "drawdown_curve":    [0.0],
     "monthly_breakdown": [],
@@ -65,6 +71,7 @@ def generate(
     risk_pct:   float,
     start_date: str | None = None,
     end_date:   str | None = None,
+    goals:      dict | None = None,
 ) -> dict:
     """
     Build a full performance report.
@@ -122,29 +129,42 @@ def generate(
     # ── Monthly breakdown ─────────────────────────────────────────────────────
     monthly_breakdown = _build_monthly_breakdown(sorted_closed, risk_pct)
 
-    # ── Goal evaluation ───────────────────────────────────────────────────────
+    # ── New metrics: daily_drawdown + monthly_drawdown ────────────────────────
+    daily_drawdown   = _calc_daily_drawdown(sorted_closed, risk_pct)
+    monthly_drawdown = _calc_monthly_drawdown(monthly_breakdown)
+
+    # ── Goal evaluation (profile-driven) ─────────────────────────────────────
     pf_display = round(profit_factor, 2) if not math.isinf(profit_factor) else 999.0
+    g = goals if goals is not None else DEFAULT_GOALS
 
     goal_detail = {
         "monthly_return": {
             "value":  round(monthly_return, 2),
-            "target": f"{GOALS['monthly_return_min']}%–{GOALS['monthly_return_max']}%",
-            "status": _rate_monthly_return(monthly_return),
+            "target": f">= {g['monthly_return_target']}%",
+            "status": _rate_gte(monthly_return, g["monthly_return_target"]),
         },
-        "max_drawdown": {
-            "value":  round(max_dd, 2),
-            "target": f"< {GOALS['max_drawdown_limit']}%",
-            "status": _rate_drawdown(max_dd),
+        "daily_drawdown": {
+            "value":  daily_drawdown,
+            "target": f"<= {g['daily_drawdown_target']}%",
+            "status": _rate_lte(daily_drawdown, g["daily_drawdown_target"]),
+        },
+        "monthly_drawdown": {
+            "value":  monthly_drawdown,
+            "target": f"<= {g['monthly_drawdown_target']}%",
+            "status": _rate_lte(monthly_drawdown, g["monthly_drawdown_target"]),
         },
         "profit_factor": {
             "value":  pf_display,
-            "target": f"> {GOALS['profit_factor_min']}",
-            "status": _rate_profit_factor(profit_factor),
+            "target": f">= {g['profit_factor_target']}",
+            "status": _rate_gte(pf_display, g["profit_factor_target"]),
         },
     }
 
-    statuses    = [g["status"] for g in goal_detail.values()]
-    goal_status = _composite_status(statuses)
+    statuses    = [gd["status"] for gd in goal_detail.values()]
+    goal_status = _composite_status_v2(statuses)
+
+    # Store only the numeric thresholds (no private _profile_* keys)
+    goals_snapshot = {k: v for k, v in g.items() if not k.startswith("_")}
 
     return {
         "total_trades":      len(closed),
@@ -158,9 +178,12 @@ def generate(
         "net_r":             round(net_r, 2),
         "monthly_return":    round(monthly_return, 2),
         "max_drawdown":      round(max_dd, 2),
+        "daily_drawdown":    daily_drawdown,
+        "monthly_drawdown":  monthly_drawdown,
         "goal_status":       goal_status,
         "goal_detail":       goal_detail,
-        "goals":             GOALS,
+        "goals":             goals_snapshot,
+        "goal_profile_name": g.get("_profile_name"),
         "equity_curve":      equity,
         "drawdown_curve":    dd_curve,
         "monthly_breakdown": monthly_breakdown,
@@ -221,31 +244,54 @@ def _calc_months(
     return 1.0
 
 
-def _rate_monthly_return(value: float) -> str:
-    lo, hi = GOALS["monthly_return_min"], GOALS["monthly_return_max"]
-    if lo <= value <= hi:
+def _rate_gte(value: float, target: float) -> str:
+    """PASS if value >= target (used for monthly return, profit factor)."""
+    return "PASS" if value >= target else "FAIL"
+
+
+def _rate_lte(value: float, target: float) -> str:
+    """PASS if value <= target (used for drawdown metrics — lower is better)."""
+    return "PASS" if value <= target else "FAIL"
+
+
+def _composite_status_v2(statuses: list[str]) -> str:
+    """
+    PASS     : all metrics are PASS.
+    WATCHLIST: >= 75% of metrics are PASS (3 of 4 with current profile).
+    FAIL     : < 75% of metrics are PASS.
+    """
+    n = len(statuses)
+    if n == 0:
+        return "INSUFFICIENT DATA"
+    passes = sum(1 for s in statuses if s == "PASS")
+    if passes == n:
         return "PASS"
-    if _WATCHLIST_MONTHLY_LO <= value < lo or hi < value <= _WATCHLIST_MONTHLY_HI:
+    if passes / n >= 0.75:
         return "WATCHLIST"
     return "FAIL"
 
 
-def _rate_drawdown(value: float) -> str:
-    limit = GOALS["max_drawdown_limit"]
-    if value < limit:
-        return "PASS"
-    if value < _WATCHLIST_DD:
-        return "WATCHLIST"
-    return "FAIL"
+def _calc_daily_drawdown(sorted_closed: list[dict], risk_pct: float) -> float:
+    """Worst single-day equity loss as % of account (0.0 if no losing day)."""
+    if not sorted_closed:
+        return 0.0
+    from collections import defaultdict
+    daily: dict = defaultdict(float)
+    for t in sorted_closed:
+        daily[t["date"]] += t["r_multiple"] * risk_pct
+    worst = min(daily.values())
+    return round(max(0.0, -worst), 2)
 
 
-def _rate_profit_factor(value: float) -> str:
-    if value >= GOALS["profit_factor_min"]:
-        return "PASS"
-    if value >= _WATCHLIST_PF:
-        return "WATCHLIST"
-    return "FAIL"
+def _calc_monthly_drawdown(monthly_breakdown: list[dict]) -> float:
+    """Worst single-month equity loss as % of account (0.0 if no losing month)."""
+    if not monthly_breakdown:
+        return 0.0
+    worst = min(m["return_pct"] for m in monthly_breakdown)
+    return round(max(0.0, -worst), 2)
 
+
+# ── Legacy helpers (kept for backward compat) ─────────────────────────────────
 
 def _composite_status(statuses: list[str]) -> str:
     if all(s == "PASS" for s in statuses):

@@ -116,11 +116,14 @@ _RESEARCH_RUNS_DDL = """
         monthly_return    REAL    NOT NULL DEFAULT 0.0,
         max_drawdown      REAL    NOT NULL DEFAULT 0.0,
         goal_status       TEXT    NOT NULL DEFAULT 'INSUFFICIENT DATA',
-        full_report       TEXT,
-        status            TEXT    NOT NULL DEFAULT 'completed',
-        backtest_start    TEXT,
-        backtest_end      TEXT,
-        analysis_sub_mode TEXT    DEFAULT 'full_backtest'
+        full_report          TEXT,
+        status               TEXT    NOT NULL DEFAULT 'completed',
+        backtest_start       TEXT,
+        backtest_end         TEXT,
+        analysis_sub_mode    TEXT    DEFAULT 'full_backtest',
+        goal_profile_id      TEXT    DEFAULT NULL,
+        goal_profile_name    TEXT    DEFAULT NULL,
+        goal_values_snapshot TEXT    DEFAULT NULL
     )
 """
 
@@ -157,6 +160,19 @@ _MONTHLY_REPORTS_DDL = """
     )
 """
 
+_GOAL_PROFILES_DDL = """
+    CREATE TABLE IF NOT EXISTS goal_profiles (
+        id                      TEXT PRIMARY KEY,
+        profile_name            TEXT NOT NULL UNIQUE,
+        monthly_return_target   REAL NOT NULL DEFAULT 5.0,
+        daily_drawdown_target   REAL NOT NULL DEFAULT 4.0,
+        monthly_drawdown_target REAL NOT NULL DEFAULT 12.0,
+        profit_factor_target    REAL NOT NULL DEFAULT 1.5,
+        is_default              INTEGER NOT NULL DEFAULT 0,
+        created_datetime        TEXT NOT NULL
+    )
+"""
+
 
 def _create_research_tables(conn) -> None:
     """CREATE IF NOT EXISTS all three research tables + their indexes."""
@@ -165,6 +181,30 @@ def _create_research_tables(conn) -> None:
     conn.execute(_MONTHLY_REPORTS_DDL)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tradelog_research ON trade_logs(research_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_monthly_research  ON monthly_reports(research_id)")
+
+
+def _seed_default_profiles(conn) -> None:
+    """Insert the two built-in goal profiles if the table is empty."""
+    count = conn.execute("SELECT COUNT(*) FROM goal_profiles").fetchone()[0]
+    if count > 0:
+        print("[db] goal_profiles: already seeded, skipping.", flush=True)
+        return
+    now = _now()
+    conn.execute(
+        """INSERT INTO goal_profiles
+           (id, profile_name, monthly_return_target, daily_drawdown_target,
+            monthly_drawdown_target, profit_factor_target, is_default, created_datetime)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (str(uuid.uuid4()), "Minimum Target", 5.0, 4.0, 12.0, 1.5, 1, now),
+    )
+    conn.execute(
+        """INSERT INTO goal_profiles
+           (id, profile_name, monthly_return_target, daily_drawdown_target,
+            monthly_drawdown_target, profit_factor_target, is_default, created_datetime)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (str(uuid.uuid4()), "Stretch Target", 8.0, 3.0, 10.0, 2.0, 0, now),
+    )
+    print("[db] goal_profiles: seeded 'Minimum Target' (default) + 'Stretch Target'.", flush=True)
 
 
 # ── FK schema validation & auto-repair ───────────────────────────────────────
@@ -318,6 +358,9 @@ def init_db() -> None:
         # ── Research ─────────────────────────────────────────────────────────
         _create_research_tables(conn)
 
+        # ── Goal Profiles ─────────────────────────────────────────────────────
+        conn.execute(_GOAL_PROFILES_DDL)
+
         # ── Indexes ───────────────────────────────────────────────────────────
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_candles_dataset ON ohlcv_candles(dataset_id)"
@@ -334,14 +377,20 @@ def init_db() -> None:
 
         # ── Column migrations (safe for existing databases) ───────────────────
         for _sql in [
-            "ALTER TABLE research_runs ADD COLUMN backtest_start    TEXT",
-            "ALTER TABLE research_runs ADD COLUMN backtest_end      TEXT",
-            "ALTER TABLE research_runs ADD COLUMN analysis_sub_mode TEXT DEFAULT 'full_backtest'",
+            "ALTER TABLE research_runs ADD COLUMN backtest_start       TEXT",
+            "ALTER TABLE research_runs ADD COLUMN backtest_end         TEXT",
+            "ALTER TABLE research_runs ADD COLUMN analysis_sub_mode    TEXT DEFAULT 'full_backtest'",
+            "ALTER TABLE research_runs ADD COLUMN goal_profile_id      TEXT DEFAULT NULL",
+            "ALTER TABLE research_runs ADD COLUMN goal_profile_name    TEXT DEFAULT NULL",
+            "ALTER TABLE research_runs ADD COLUMN goal_values_snapshot TEXT DEFAULT NULL",
         ]:
             try:
                 conn.execute(_sql)
             except sqlite3.OperationalError:
                 pass   # column already exists → no-op
+
+        # ── Seed default goal profiles (only if table is empty) ───────────────
+        _seed_default_profiles(conn)
 
     print("[db] init_db() complete.", flush=True)
 
@@ -498,8 +547,9 @@ def create_research_run(conn, rid: str, **kw) -> str:
             total_trades, wins, losses, win_rate,
             profit_factor, net_r, monthly_return,
             max_drawdown, goal_status, full_report, status,
-            backtest_start, backtest_end, analysis_sub_mode
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            backtest_start, backtest_end, analysis_sub_mode,
+            goal_profile_id, goal_profile_name, goal_values_snapshot
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             rid,
             _now(),
@@ -526,6 +576,9 @@ def create_research_run(conn, rid: str, **kw) -> str:
             kw.get("backtest_start"),
             kw.get("backtest_end"),
             kw.get("analysis_sub_mode", "full_backtest"),
+            kw.get("goal_profile_id"),
+            kw.get("goal_profile_name"),
+            kw.get("goal_values_snapshot"),
         ),
     )
     print(f"[db] research_runs row inserted: {rid}", flush=True)
@@ -602,6 +655,9 @@ def save_research_run_complete(
     backtest_start: str | None = None,
     backtest_end: str | None = None,
     analysis_sub_mode: str = "full_backtest",
+    goal_profile_id: str | None = None,
+    goal_profile_name: str | None = None,
+    goal_values_snapshot: str | None = None,
 ) -> str:
     """
     Persist a research run atomically.
@@ -628,19 +684,22 @@ def save_research_run_complete(
         # Step 1 — parent: research_runs
         create_research_run(
             conn, rid,
-            research_name    = research_name,
-            selected_module  = selected_module,
-            symbol           = symbol,
-            timeframe_mode   = timeframe_mode,
-            timeframes_used  = timeframes_used,
-            dataset_ids_used = dataset_ids_used,
-            risk_percent     = risk_percent,
-            reward_risk_ratio= reward_risk_ratio,
-            lookback         = lookback,
-            report           = report,
-            backtest_start   = backtest_start,
-            backtest_end     = backtest_end,
-            analysis_sub_mode= analysis_sub_mode,
+            research_name        = research_name,
+            selected_module      = selected_module,
+            symbol               = symbol,
+            timeframe_mode       = timeframe_mode,
+            timeframes_used      = timeframes_used,
+            dataset_ids_used     = dataset_ids_used,
+            risk_percent         = risk_percent,
+            reward_risk_ratio    = reward_risk_ratio,
+            lookback             = lookback,
+            report               = report,
+            backtest_start       = backtest_start,
+            backtest_end         = backtest_end,
+            analysis_sub_mode    = analysis_sub_mode,
+            goal_profile_id      = goal_profile_id,
+            goal_profile_name    = goal_profile_name,
+            goal_values_snapshot = goal_values_snapshot,
         )
 
         # Step 2 — children: trade_logs
@@ -757,6 +816,105 @@ def get_monthly_reports(research_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── Goal profile CRUD ─────────────────────────────────────────────────────────
+
+def list_goal_profiles() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM goal_profiles ORDER BY is_default DESC, profile_name ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_goal_profile(profile_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM goal_profiles WHERE id=?", (profile_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_default_goal_profile() -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM goal_profiles WHERE is_default=1 LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_goal_profile(
+    profile_name: str,
+    monthly_return_target: float,
+    daily_drawdown_target: float,
+    monthly_drawdown_target: float,
+    profit_factor_target: float,
+    is_default: bool = False,
+) -> str:
+    pid = str(uuid.uuid4())
+    with _connect() as conn:
+        if is_default:
+            conn.execute("UPDATE goal_profiles SET is_default=0 WHERE is_default=1")
+        conn.execute(
+            """INSERT INTO goal_profiles
+               (id, profile_name, monthly_return_target, daily_drawdown_target,
+                monthly_drawdown_target, profit_factor_target, is_default, created_datetime)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (pid, profile_name, monthly_return_target, daily_drawdown_target,
+             monthly_drawdown_target, profit_factor_target, 1 if is_default else 0, _now()),
+        )
+    print(f"[db] goal_profile created: {pid} ({profile_name})", flush=True)
+    return pid
+
+
+def update_goal_profile(
+    profile_id: str,
+    profile_name: str,
+    monthly_return_target: float,
+    daily_drawdown_target: float,
+    monthly_drawdown_target: float,
+    profit_factor_target: float,
+) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE goal_profiles
+               SET profile_name=?, monthly_return_target=?, daily_drawdown_target=?,
+                   monthly_drawdown_target=?, profit_factor_target=?
+               WHERE id=?""",
+            (profile_name, monthly_return_target, daily_drawdown_target,
+             monthly_drawdown_target, profit_factor_target, profile_id),
+        )
+    return cur.rowcount > 0
+
+
+def delete_goal_profile(profile_id: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT is_default FROM goal_profiles WHERE id=?", (profile_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["is_default"]:
+            raise ValueError(
+                "Cannot delete the default goal profile. "
+                "Set another profile as default first."
+            )
+        cur = conn.execute("DELETE FROM goal_profiles WHERE id=?", (profile_id,))
+    return cur.rowcount > 0
+
+
+def set_default_goal_profile(profile_id: str) -> bool:
+    with _connect() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM goal_profiles WHERE id=?", (profile_id,)
+        ).fetchone():
+            return False
+        conn.execute("UPDATE goal_profiles SET is_default=0 WHERE is_default=1")
+        cur = conn.execute(
+            "UPDATE goal_profiles SET is_default=1 WHERE id=?", (profile_id,)
+        )
+    return cur.rowcount > 0
+
+
 # ── Platform health & admin ───────────────────────────────────────────────────
 
 def get_db_health() -> dict:
@@ -765,13 +923,14 @@ def get_db_health() -> dict:
     Never raises — errors are captured in the 'connection' field.
     """
     result: dict = {
-        "db_path":         str(DB_PATH.resolve()),
-        "db_file_exists":  DB_PATH.exists(),
-        "db_file_size_kb": round(DB_PATH.stat().st_size / 1024, 1) if DB_PATH.exists() else 0,
-        "connection":      "error",
-        "foreign_keys_on": False,
-        "tables":          {},
-        "latest_research_run": None,
+        "db_path":              str(DB_PATH.resolve()),
+        "db_file_exists":       DB_PATH.exists(),
+        "db_file_size_kb":      round(DB_PATH.stat().st_size / 1024, 1) if DB_PATH.exists() else 0,
+        "connection":           "error",
+        "foreign_keys_on":      False,
+        "tables":               {},
+        "latest_research_run":  None,
+        "default_goal_profile": None,
     }
     try:
         with _connect() as conn:
@@ -793,6 +952,17 @@ def get_db_health() -> dict:
             if row:
                 result["latest_research_run"] = dict(row)
 
+            try:
+                gp = conn.execute(
+                    "SELECT id, profile_name, monthly_return_target, daily_drawdown_target, "
+                    "monthly_drawdown_target, profit_factor_target "
+                    "FROM goal_profiles WHERE is_default=1 LIMIT 1"
+                ).fetchone()
+                if gp:
+                    result["default_goal_profile"] = dict(gp)
+            except Exception:
+                pass  # table may not exist on very old DB before migration
+
             result["connection"] = "ok"
     except Exception as exc:
         result["connection"] = f"error: {exc}"
@@ -813,6 +983,7 @@ def reset_database() -> None:
             "monthly_reports", "trade_logs", "research_runs",
             "ohlcv_candles", "datasets",
             "analyses", "uploads",
+            "goal_profiles",
         ]:
             conn.execute(f"DROP TABLE IF EXISTS {tbl}")
         conn.execute("COMMIT")
