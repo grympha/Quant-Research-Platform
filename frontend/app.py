@@ -52,7 +52,7 @@ _SUB_MODE_API = {
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="XAUUSD Quant Research",
+    page_title="Quant Research Platform",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -81,7 +81,7 @@ st.markdown("""
 # ── Header ────────────────────────────────────────────────────────────────────
 col_t, col_s = st.columns([3, 1])
 with col_t:
-    st.title("📊 XAUUSD Quant Research Platform")
+    st.title("📊 Quant Research Platform")
     st.caption("v3.2 — Phase 1.5 Stability · Platform Health · Reset DB")
 with col_s:
     try:
